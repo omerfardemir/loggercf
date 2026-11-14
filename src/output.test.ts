@@ -274,6 +274,18 @@ const short = <E extends Error>(error: E): E => {
 }
 /** How a `short()` Error with `message` serializes, with nothing else on it. */
 const plain = (message: string, type = 'Error') => ({ type, message, stack: 'stack' })
+/** `error`, with an own `toJSON` property. */
+const withToJSON = <E extends Error>(error: E, toJSON: unknown): E =>
+  Object.assign(error, { toJSON })
+/** An Error made in another realm (a `vm` context), with a short stack. */
+const fromVm = (script: string): Error => {
+  const error = vm.runInNewContext(script) as Error
+  error.stack = 'stack'
+  return error
+}
+/** `error`, with a non-enumerable `errors` array, as an `AggregateError` has. */
+const withErrors = <E extends Error>(error: E): E =>
+  Object.defineProperty(error, 'errors', { value: [new Error('inner')], enumerable: false })
 
 describe('errors at any depth', () => {
   beforeEach(() => _reset())
@@ -451,6 +463,113 @@ describe('errors at any depth', () => {
     createLogger({ service: 'svc' }).error({ detail: { foreign } }, 'm')
     expect(entries[0]).toMatchObject({ message: 'from vm', err: plain('from vm', 'RangeError') })
     expect(entries[1].detail).toEqual({ foreign: plain('from vm', 'RangeError') })
+  })
+
+  it('an AggregateError from another realm writes its errors, at the top level and nested', () => {
+    const entries = _captureEntries()
+    const foreign = fromVm('new AggregateError([new RangeError("e1"), 3], "all failed")')
+    const subclass = fromVm(
+      'class Batch extends AggregateError {}; new Batch([new TypeError("e2")], "batch")',
+    )
+    expect(foreign instanceof AggregateError).toBe(false)
+    const logger = createLogger({ service: 'svc' })
+    logger.error(foreign)
+    logger.error({ detail: { foreign, subclass } }, 'nested')
+    const written = {
+      type: 'AggregateError',
+      message: 'all failed',
+      stack: 'stack',
+      errors: [{ type: 'RangeError', message: 'e1', stack: expect.any(String) }, 3],
+    }
+    expect(entries[0]).toMatchObject({ message: 'all failed', err: written })
+    expect(entries[1].detail).toMatchObject({
+      foreign: written,
+      subclass: { type: 'Batch', message: 'batch', errors: [{ type: 'TypeError', message: 'e2' }] },
+    })
+  })
+
+  it('only an AggregateError writes its errors: fakes and Proxies never make the call throw', () => {
+    const entries = _captureEntries()
+    const fake = withErrors(Object.create(Error.prototype) as Error)
+    const plainError = withErrors(short(new Error('plain')))
+    const foreignPlain = withErrors(fromVm('new RangeError("rp")'))
+    const named = Object.create(Error.prototype) as Error
+    named.name = 'AggregateError'
+    const looping = Object.create(Error.prototype) as Error
+    const loop: unknown = new Proxy(looping, { getPrototypeOf: () => loop as object })
+    const throwing = new Proxy(new Error('p'), {
+      getOwnPropertyDescriptor() {
+        throw new Error('trap')
+      },
+      getPrototypeOf() {
+        throw new Error('trap')
+      },
+    })
+    const { proxy: revoked, revoke } = Proxy.revocable(new Error('r'), {})
+    revoke()
+    const logger = createLogger({ service: 'svc' })
+    const fakes = { fake, plainError, foreignPlain, named, loop, throwing, revoked }
+    expect(() => {
+      logger.error({ n: fakes }, 'nested')
+      logger.error(fakes, 'top')
+    }).not.toThrow()
+    for (const entry of entries) {
+      const written = (entry.n ?? entry) as Record<string, Record<string, unknown>>
+      for (const key of ['fake', 'plainError', 'foreignPlain', 'named'])
+        expect(Object.keys(written[key])).not.toContain('errors')
+    }
+  })
+
+  it('an Error with its own toJSON keeps the Error shape at the top level', () => {
+    const entries = _captureEntries()
+    const replaced = withToJSON(short(new Error('m')), () => ({ custom: 1 }))
+    // Called on the copy, `this.describe` is not there: the whole `err` was `[Unserializable: ...]`.
+    const methods = withToJSON(short(new DbError('uses this')), function toJSON(this: unknown) {
+      return (this as { describe: () => string }).describe()
+    })
+    const logger = createLogger({ service: 'svc' })
+    logger.error(replaced)
+    logger.error(methods)
+    logger.error({ err: replaced, n: 1 }, 'in fields')
+    expect(entries[0]).toMatchObject({
+      message: 'm',
+      err: { ...plain('m'), toJSON: '[Function: anonymous]' },
+    })
+    expect(entries[1].err).toEqual({
+      ...plain('uses this', 'DbError'),
+      code: 'E_DB',
+      toJSON: '[Function: toJSON]',
+    })
+    expect(entries[2].err).toEqual({ ...plain('m'), toJSON: '[Function: anonymous]' })
+  })
+
+  it('an Error with its own toJSON keeps the Error shape inside another Error', () => {
+    const entries = _captureEntries()
+    const own = withToJSON(short(new Error('inner')), function toJSON() {
+      throw new Error('never called')
+    })
+    const outer = Object.assign(short(new Error('outer', { cause: own })), { holder: own })
+    const logger = createLogger({ service: 'svc' })
+    logger.error(outer)
+    logger.error({ detail: { outer } }, 'nested')
+    const inner = { ...plain('inner'), toJSON: '[Function: toJSON]' }
+    const shape = { ...plain('outer'), holder: inner, cause: inner }
+    expect(entries[0].err).toEqual(shape)
+    expect((entries[1].detail as Record<string, unknown>).outer).toEqual(shape)
+  })
+
+  it('a nested Error with its own toJSON is still written by it, as JSON does', () => {
+    const entries = _captureEntries()
+    const own = withToJSON(short(new Error('m')), () => ({ custom: 1 }))
+    createLogger({ service: 'svc' }).error({ a: { own } }, 'nested')
+    expect(entries[0].a).toEqual({ own: { custom: 1 } })
+  })
+
+  it('a non-function toJSON on an Error is kept as a field', () => {
+    const entries = _captureEntries()
+    const error = withToJSON(short(new Error('m')), { a: 1 })
+    createLogger({ service: 'svc' }).error(error)
+    expect(entries[0].err).toEqual({ ...plain('m'), toJSON: { a: 1 } })
   })
 
   it('a nested Error with a toJSON is written by it, as JSON does, on both paths', () => {
