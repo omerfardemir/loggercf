@@ -70,11 +70,11 @@ The `serializeError` Logger Option, `(err, defaultSerialize) => object`: writes 
 _Avoid_: error formatter, redaction
 
 **Line Limits**:
-The `limits` Logger Option, off by default. `maxStringLength` cuts a longer string value, wherever it is, to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a line larger than that many UTF-8 bytes to fit, largest values first, keeping the Protected Fields. Whatever they cut or trim is marked in the line.
+The `limits` Logger Option, off by default. `maxStringLength` cuts a longer string value, wherever it is, to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a line larger than that many UTF-8 bytes to fit, largest values first, keeping the Protected Fields; many small values lose the tail of their array or object instead (`"[Trimmed: <n> items, <bytes> bytes]"`, or a `"[Trimmed]"` key holding `"[Trimmed: <n> keys, <bytes> bytes]"`), so the leading ones stay whole. Whatever they cut or trim is marked in the line.
 _Avoid_: truncation (only one of the two), size cap
 
 **Protected Fields**:
-What `maxRecordBytes` keeps whole while anything else on a line can go: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. Only when they alone don't fit are `message` and `err.message` cut too. `maxStringLength` never cuts them, except `message` and `err.message`.
+What `maxRecordBytes` keeps whole while anything else on a line can go: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. Only when they alone don't fit are `message` and `err.message` cut too, and as a last resort the line keeps the trace IDs and `logError`, with `service`, `environment`, `version`, `message` and `err.type` cut to fit (dropped only if the cut one doesn't fit). `maxStringLength` never cuts them, except `message` and `err.message`.
 _Avoid_: Record Keys, Moved Keys, Owned Keys (each is another rule)
 
 **Entrypoint Hook**:

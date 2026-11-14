@@ -217,6 +217,16 @@ const PROTECTED_ERR_KEYS: ReadonlySet<string> = new Set(['type', 'message'])
 const SMALL = 32
 
 /**
+ * A value of this many bytes or less is never cut or replaced on its own: it
+ * saves too little for what it loses. The tail of its container is dropped
+ * instead (see `dropTail()` and `dropTailKeys()`), so the leading values stay whole.
+ */
+const LEAVE = 128
+
+/** The key `dropTailKeys()` writes its marker under. */
+const TRIMMED_KEY = '[Trimmed]'
+
+/**
  * What the items `dropTail()` takes off an array are replaced with.
  *
  * @param {number} items - How many.
@@ -252,6 +262,71 @@ function dropTail(list: unknown[], need: number, sizes: Map<object, number>): nu
 }
 
 /**
+ * What the keys `dropTailKeys()` takes off an object are replaced with.
+ *
+ * @param {number} keys - How many.
+ * @param {number} bytes - How many bytes they took in the line.
+ * @returns {string} The marker.
+ */
+const droppedKeysMarker = (keys: number, bytes: number): string =>
+  `[Trimmed: ${keys} keys, ${bytes} bytes]`
+
+/**
+ * Whether `kind` keeps `key` whole in `node` (see `shrink()`), for the tail pass:
+ * a Protected Field, and at the root `err` too, which keeps `type` and `message`.
+ *
+ * @param {'root' | 'err' | 'value'} kind - What the object is.
+ * @param {string} key - One of its keys.
+ * @returns {boolean} `true` when `key` stays.
+ */
+const staysInTail = (kind: 'root' | 'err' | 'value', key: string): boolean =>
+  kind === 'root'
+    ? PROTECTED.has(key) || key === 'err'
+    : kind === 'err' && PROTECTED_ERR_KEYS.has(key)
+
+/**
+ * Take at least `need` bytes off the end of an object of values too small to
+ * trim one by one: its last keys, in key order, are replaced with one entry,
+ * `"[Trimmed]": droppedKeysMarker()`. Protected Fields stay. The leading keys
+ * stay whole.
+ *
+ * @param {Tree} node - The object. Mutated.
+ * @param {number} need - How many bytes to take out.
+ * @param {Map<object, number>} sizes - The sizes measured so far.
+ * @param {'root' | 'err' | 'value'} kind - What the object is (see `shrink()`).
+ * @returns {number} How many bytes it took out; `0` when that would save nothing.
+ */
+function dropTailKeys(
+  node: Tree,
+  need: number,
+  sizes: Map<object, number>,
+  kind: 'root' | 'err' | 'value',
+): number {
+  const keys = Object.keys(node)
+  let markerKey = TRIMMED_KEY
+  while (Object.hasOwn(node, markerKey)) markerKey += '_'
+  const entryOverhead = stringBytes(markerKey) + 1
+  const dropped: string[] = []
+  let removed = 0
+  let saved = 0
+  let marker = ''
+  // Without `k` keys and with the entry, the object is `removed + (k - 1) - entry` bytes smaller.
+  for (let i = keys.length - 1; i >= 0; i--) {
+    const key = keys[i]
+    if (staysInTail(kind, key)) continue
+    removed += stringBytes(key) + 1 + sizeOf(node[key], sizes)
+    dropped.push(key)
+    marker = droppedKeysMarker(dropped.length, removed)
+    saved = removed + (dropped.length - 1) - (entryOverhead + marker.length + 2)
+    if (saved >= need) break
+  }
+  if (saved <= 0) return 0
+  for (const key of dropped) delete node[key]
+  node[markerKey] = marker
+  return saved
+}
+
+/**
  * Whether `value` is an object `JSON.parse` made: an array or a plain object.
  *
  * @param {unknown} value - A value from `JSON.parse`.
@@ -265,9 +340,10 @@ const isContainer = (value: unknown): value is Tree | unknown[] =>
  * how many it took. A string larger than what is still needed is cut (see
  * `cutToBytes()`), and a container larger than that is trimmed the same way
  * inside, or replaced with `trimmedMarker()` when that can't take enough. A
- * smaller value is replaced with `trimmedMarker()`. Values of `SMALL` bytes
- * or less are left, but an array still too large loses its last items (see
- * `dropTail()`). Each container is sorted once, and only along one path (the
+ * smaller value is replaced with `trimmedMarker()`. Values of `LEAVE` bytes
+ * or less are left, but a container still too large loses its last items or
+ * keys (see `dropTail()` and `dropTailKeys()`), so its leading values stay
+ * whole. Each container is sorted once, and only along one path (the
  * value larger than what is needed), so the work is about linear in the line.
  *
  * @param {Tree | unknown[]} node - A container. Mutated.
@@ -293,10 +369,12 @@ function shrink(
   let saved = 0
   for (const [key, size] of entries) {
     const left = need - saved
-    if (left <= 0 || size <= SMALL) break
+    if (left <= 0 || size <= LEAVE) break
     const value = (node as Tree)[key]
     if (kind === 'root' && key === 'err' && isContainer(value) && !Array.isArray(value)) {
-      saved += shrink(value, left, sizes, 'err')
+      const inside = shrink(value, left, sizes, 'err')
+      sizes.set(value, size - inside)
+      saved += inside
       continue
     }
     if (typeof value === 'string') {
@@ -311,6 +389,7 @@ function shrink(
     if (!isContainer(value)) continue
     if (size > left + SMALL) {
       const inside = shrink(value, left, sizes, 'value')
+      sizes.set(value, size - inside)
       if (inside >= left) {
         saved += inside
         continue
@@ -323,8 +402,11 @@ function shrink(
       saved += size - markerSize
     }
   }
-  // An array of many small items keeps the ones it can, from the start.
-  if (saved < need && Array.isArray(node)) saved += dropTail(node, need - saved, sizes)
+  // Many small items or fields keep the ones that fit, from the start.
+  if (saved < need)
+    saved += Array.isArray(node)
+      ? dropTail(node, need - saved, sizes)
+      : dropTailKeys(node, need - saved, sizes, kind)
   return saved
 }
 
@@ -372,20 +454,80 @@ function cutMessages(root: Tree, need: number): void {
   }
 }
 
+/** The trace IDs the last-resort line keeps whole: short and fixed in size. */
+const TRACE_KEYS: readonly string[] = ['traceId', 'spanId', 'parentSpanId']
+
+/** The longest trace ID the last-resort line keeps; a real one is 32 characters at most. */
+const MAX_TRACE_ID = 64
+
 /**
- * The last resort: `time`, `level` and `logError`, which always fits.
+ * A text field of the last-resort line: where it goes (`err.type` is inside `err`) and its text.
+ */
+interface TextField {
+  path: readonly [string] | readonly [string, string]
+  text: string
+}
+
+/**
+ * Write `text` at the field's path in `out`.
  *
- * @param {Tree} record - The record the line was written from.
+ * @param {Tree} out - The record. Mutated.
+ * @param {TextField['path']} path - Where.
+ * @param {string | undefined} text - The text; `undefined` takes the field out.
+ */
+function setText(out: Tree, path: TextField['path'], text: string | undefined): void {
+  if (path.length === 1) {
+    if (text === undefined) delete out[path[0]]
+    else out[path[0]] = text
+    return
+  }
+  if (text === undefined) delete out[path[0]]
+  else out[path[0]] = { [path[1]]: text }
+}
+
+/**
+ * The last resort: `time`, `level`, the trace IDs and `logError`, which always
+ * fit, and then `service`, `environment`, `version`, `message` and `err.type`.
+ * Each of those is kept whole when it fits, else cut with `cutMarker()` to its
+ * share of what is left (the shortest first, so a short one gives its room
+ * to the rest), and dropped only when even the cut one doesn't fit.
+ *
+ * @param {Tree} source - The record the line was written from, or its line read back.
  * @param {number} max - `maxRecordBytes`.
  * @returns {string} The line.
  */
-function minimalLine(record: Tree, max: number): string {
-  const { time, level } = record
-  return JSON.stringify({
+function minimalLine(source: Tree, max: number): string {
+  const { time, level } = source
+  const out: Tree = {
     time: typeof time === 'string' ? time.slice(0, 64) : undefined,
     level: typeof level === 'string' ? level.slice(0, 16) : undefined,
-    logError: `line over maxRecordBytes (${max})`,
-  })
+  }
+  for (const key of TRACE_KEYS) {
+    const id = source[key]
+    if (typeof id === 'string') out[key] = id.slice(0, safeEnd(id, MAX_TRACE_ID))
+  }
+  out.logError = `line over maxRecordBytes (${max})`
+  const fields: TextField[] = []
+  for (const key of ['service', 'environment', 'version', 'message'])
+    if (typeof source[key] === 'string') fields.push({ path: [key], text: source[key] })
+  const err = source.err
+  if (isContainer(err) && !Array.isArray(err) && typeof err.type === 'string')
+    fields.push({ path: ['err', 'type'], text: err.type })
+  fields.sort((a, b) => a.text.length - b.text.length)
+  const size = () => utf8Bytes(JSON.stringify(out))
+  for (let i = 0; i < fields.length; i++) {
+    const { path, text } = fields[i]
+    const used = size()
+    // Its share of what is left, the shortest fields first.
+    const allowance = used + Math.floor((max - used) / (fields.length - i))
+    setText(out, path, text)
+    if (size() <= allowance) continue
+    setText(out, path, '')
+    const room = allowance - size() + 2
+    setText(out, path, room > 0 ? cutToBytes(text, room) : undefined)
+    if (size() > allowance) setText(out, path, undefined)
+  }
+  return JSON.stringify(out)
 }
 
 /**
@@ -398,7 +540,9 @@ function minimalLine(record: Tree, max: number): string {
  * 2. if that is not enough, only the Protected Fields are kept, with a
  *    `logError` that says so;
  * 3. then `message` and `err.message` are cut too;
- * 4. and if even that does not fit, the line is `time`, `level` and `logError`.
+ * 4. and if even that does not fit, the line is `time`, `level`, the trace IDs
+ *    and `logError`, with `service`, `environment`, `version`, `message` and
+ *    `err.type` cut to fit, or left out when even the cut one doesn't.
  *
  * Each step measures the line once and writes it once, so the work is about
  * linear in its size. Never throws.
@@ -416,8 +560,10 @@ export function fitLine(line: string, record: Record<string, unknown>, max: numb
     bytes = utf8Bytes(line)
     if (bytes <= max) return line
   } else bytes = utf8Bytes(line)
+  let source: Tree = record
   try {
     let root = JSON.parse(line) as Tree
+    source = root
     const sizes = new Map<object, number>()
     shrink(root, bytes - max, sizes, 'root')
     let out = JSON.stringify(root)
@@ -432,5 +578,9 @@ export function fitLine(line: string, record: Record<string, unknown>, max: numb
   } catch {
     // Fall through to the last resort.
   }
-  return minimalLine(record, max)
+  try {
+    return minimalLine(source, max)
+  } catch {
+    return minimalLine({ time: record.time, level: record.level }, max)
+  }
 }
