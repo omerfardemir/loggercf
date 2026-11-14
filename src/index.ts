@@ -9,6 +9,8 @@ export type {
   LoggerOptions,
   ErrorSerializer,
   LineLimits,
+  Redactor,
+  RedactKeysOptions,
   Logger,
   LogLevel,
 } from './types'
@@ -24,6 +26,7 @@ export {
   getTraceCarrier,
 } from './logger'
 export { omitErrorKeys } from './omit'
+export { redactKeys } from './redact'
 export { tracedFetch, tracedFetcher } from './fetch'
 export type { TracedFetchOptions } from './fetch'
 export { loggerOptionsFromEnv } from './env'

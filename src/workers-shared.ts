@@ -5,6 +5,7 @@ import type {
   ErrorSerializer,
   Logger,
   LoggerOptions,
+  Redactor,
   Span,
   SpanOptions,
   TraceCarrier,
@@ -35,48 +36,71 @@ export interface RootLoggerSource<E = unknown> {
    * module scope, not in the call.
    */
   serializeError?: ErrorSerializer
+  /**
+   * The Root Logger's `redact` (see `LoggerOptions`): code, so it can't come from
+   * env; choose it per environment in code. The same object gives the same Root
+   * Logger, so define it once, at module scope (`redactKeys()` gives the same one
+   * for the same keys, even inline).
+   */
+  redact?: Redactor | false
 }
+
+/** The code-only Logger Options of a helper's options: all but the Env Mapping. */
+export type CodeOptions = Pick<RootLoggerSource, 'serializeError' | 'redact'>
 
 /**
  * Whether two helpers' Root Logger sources are the same: the same Env Mapping
- * (see `sameEnvMapping()`) and the same `serializeError` function.
+ * (see `sameEnvMapping()`), the same `serializeError` function and the same
+ * `redact` object (`false` and absent are the same).
  *
  * @param {RootLoggerSource<any>} a - One helper's options.
  * @param {RootLoggerSource<any>} b - The other's.
  * @returns {boolean} `true` when they give the same Root Logger.
  */
 export function sameRootLoggerSource(a: RootLoggerSource<any>, b: RootLoggerSource<any>): boolean {
-  return sameEnvMapping(a.env, b.env) && a.serializeError === b.serializeError
+  return (
+    sameEnvMapping(a.env, b.env) &&
+    a.serializeError === b.serializeError &&
+    (a.redact || undefined) === (b.redact || undefined)
+  )
 }
 
+/** Stands for a code-only option that is not set, in `rootLoggers`. */
+const ABSENT = {}
+
 /**
- * Root Loggers without a `serializeError`, keyed by their other Logger Options
- * (see `optionsKey()`), one per isolate.
+ * Root Loggers by their code-only options, by identity: `serializeError`, then
+ * `redact` (`ABSENT` for one that is not set), then by their other Logger Options
+ * (see `optionsKey()`), one per isolate. Weak, so the loggers built for a
+ * function or a redactor nothing else holds (one made in a request) go when it
+ * does, instead of piling up in the isolate.
  *
  * Safe to share across concurrent requests because a Root Logger carries only
  * per-process data; per-request data lives in each Logging Context.
  */
-const rootLoggers = new Map<string, Logger>()
+let rootLoggers = new WeakMap<object, WeakMap<object, Map<string, Logger>>>()
+
+/** A code-only option that is cached by identity. */
+type CodeOption = 'serializeError' | 'redact'
+
+/** The functions and objects of each code-only option Root Loggers were built with in this isolate. */
+let codeSeen: Record<CodeOption, WeakSet<object>> = {
+  serializeError: new WeakSet(),
+  redact: new WeakSet(),
+}
+
+/** How many of each code-only option have had Root Loggers built in this isolate. */
+let codeCounts: Record<CodeOption, number> = { serializeError: 0, redact: 0 }
 
 /**
- * Root Loggers with a `serializeError`, by that function, then by their other
- * Logger Options. Weak, so the loggers built for a function nothing else holds
- * (a closure made in a request) go when it does, instead of piling up in the
- * isolate.
+ * Past this many `serializeError` functions, or `redact` objects, one WARN says a
+ * new one is made on each call. A Worker needs one per Root Logger, usually one in
+ * all.
  */
-let serializerRootLoggers = new WeakMap<ErrorSerializer, Map<string, Logger>>()
-
-/** How many `serializeError` functions have had Root Loggers built in this isolate. */
-let serializersSeen = 0
+const MAX_CODE_OPTIONS = 16
 
 /**
- * Past this many `serializeError` functions, one WARN says a new one is made on
- * each call. A Worker needs one per Root Logger, usually one in all.
- */
-const MAX_SERIALIZERS = 16
-
-/**
- * The cache key for Logger Options: every option but `serializeError`.
+ * The cache key for Logger Options: every option but the code-only ones.
  *
  * @param {LoggerOptions} options - The Logger Options.
  * @returns {string} The key.
@@ -96,82 +120,94 @@ function optionsKey(options: LoggerOptions): string {
 }
 
 /**
- * The Root Loggers built with `serializeError`, made empty the first time it is
- * seen. The first one past `MAX_SERIALIZERS` writes one WARN per isolate.
+ * Count a code-only option's function or object the first time it is seen. The
+ * first one past `MAX_CODE_OPTIONS` writes one WARN per isolate.
  *
- * @param {ErrorSerializer} serializeError - The function.
+ * @param {CodeOption} option - Which option.
+ * @param {object} value - Its function or object.
  * @param {LoggerOptions} options - The Logger Options, for the warning.
- * @returns {Map<string, Logger>} Its Root Loggers, by `optionsKey()`.
  */
-function loggersFor(serializeError: ErrorSerializer, options: LoggerOptions): Map<string, Logger> {
-  let loggers = serializerRootLoggers.get(serializeError)
-  if (loggers) return loggers
-  loggers = new Map()
-  serializerRootLoggers.set(serializeError, loggers)
-  if (++serializersSeen === MAX_SERIALIZERS + 1) {
-    const { service, environment, version } = options
-    createLogger({ service, environment, version }).warn(
-      { serializeErrorFunctions: serializersSeen },
+function countCodeOption(option: CodeOption, value: object, options: LoggerOptions): void {
+  const seen = codeSeen[option]
+  if (seen.has(value)) return
+  seen.add(value)
+  if (++codeCounts[option] !== MAX_CODE_OPTIONS + 1) return
+  const { service, environment, version } = options
+  const logger = createLogger({ service, environment, version })
+  if (option === 'serializeError') {
+    logger.warn(
+      { serializeErrorFunctions: codeCounts[option] },
       'serializeError is a new function each call; define it once at module scope',
     )
+  } else {
+    logger.warn(
+      { redactObjects: codeCounts[option] },
+      'redact is a new object each call; define it once at module scope',
+    )
   }
-  return loggers
 }
 
 /**
  * Get the isolate's Root Logger for these Logger Options, creating it once.
- * A `serializeError` is matched by identity: another function, even one that
- * does the same, gets a Root Logger of its own.
+ * A `serializeError` and a `redact` are matched by identity: another function or
+ * object, even one that does the same, gets a Root Logger of its own.
  *
  * @param {LoggerOptions} options - Logger Options (usually from `loggerOptionsFromEnv`).
  * @returns {Logger} The cached Root Logger.
  */
 export function cachedRootLogger(options: LoggerOptions): Logger {
-  const { serializeError } = options
-  const loggers =
-    typeof serializeError === 'function' ? loggersFor(serializeError, options) : rootLoggers
+  const { serializeError, redact } = options
+  const bySerializer: object = typeof serializeError === 'function' ? serializeError : ABSENT
+  const byRedactor: object = typeof redact === 'object' && redact !== null ? redact : ABSENT
+  let forSerializer = rootLoggers.get(bySerializer)
+  if (!forSerializer) rootLoggers.set(bySerializer, (forSerializer = new WeakMap()))
+  let loggers = forSerializer.get(byRedactor)
+  if (!loggers) forSerializer.set(byRedactor, (loggers = new Map()))
   const key = optionsKey(options)
   let logger = loggers.get(key)
   if (!logger) {
-    logger = createLogger(options)
+    logger = createLogger(options) // first: an invalid option throws, and is not counted
+    if (bySerializer !== ABSENT) countCodeOption('serializeError', bySerializer, options)
+    if (byRedactor !== ABSENT) countCodeOption('redact', byRedactor, options)
     loggers.set(key, logger)
   }
   return logger
 }
 
-/** Test only: forget every cached Root Logger and the `serializeError` count. */
+/** Test only: forget every cached Root Logger and the code-only option counts. */
 export function _resetRootLoggers(): void {
-  rootLoggers.clear()
-  serializerRootLoggers = new WeakMap()
-  serializersSeen = 0
+  rootLoggers = new WeakMap()
+  codeSeen = { serializeError: new WeakSet(), redact: new WeakSet() }
+  codeCounts = { serializeError: 0, redact: 0 }
 }
 
 /**
  * The isolate's cached Root Logger for a Worker env, read through a helper's
- * Env Mapping, with the `serializeError` it was given in code.
+ * Env Mapping, with the code-only options it was given.
  *
  * @param {unknown} env - The Worker's env.
- * @param {RootLoggerSource<any>} [source] - The helper's `env` and `serializeError` options.
+ * @param {RootLoggerSource<any>} [source] - The helper's `env`, `serializeError` and `redact` options.
  * @returns {Logger} The cached Root Logger.
  */
 export function envRootLogger(env: unknown, source: RootLoggerSource<any> = {}): Logger {
-  return cachedRootLogger(
-    withSerializer(loggerOptionsFromEnv(env, source.env), source.serializeError),
-  )
+  return cachedRootLogger(withCodeOptions(loggerOptionsFromEnv(env, source.env), source))
 }
 
 /**
- * Logger Options with a helper's `serializeError` added, when it has one.
+ * Logger Options with a helper's `serializeError` and `redact` added, when it
+ * has them.
  *
  * @param {LoggerOptions} options - The Logger Options.
- * @param {ErrorSerializer} [serializeError] - The helper's `serializeError` option.
- * @returns {LoggerOptions} `options`, or a copy with `serializeError`.
+ * @param {CodeOptions} code - The helper's `serializeError` and `redact` options.
+ * @returns {LoggerOptions} `options`, or a copy with them.
  */
-export function withSerializer(
-  options: LoggerOptions,
-  serializeError: ErrorSerializer | undefined,
-): LoggerOptions {
-  return serializeError === undefined ? options : { ...options, serializeError }
+export function withCodeOptions(options: LoggerOptions, code: CodeOptions): LoggerOptions {
+  const { serializeError, redact } = code
+  if (serializeError === undefined && redact === undefined) return options
+  const out: LoggerOptions = { ...options }
+  if (serializeError !== undefined) out.serializeError = serializeError
+  if (redact !== undefined) out.redact = redact
+  return out
 }
 
 /**

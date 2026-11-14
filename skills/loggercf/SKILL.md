@@ -529,6 +529,51 @@ await withQueueMessage(batch, message, fn, {
 })
 ```
 
+### Secrets and personal data: `redact`
+
+loggercf writes what you log as it is: nothing is redacted unless the app sets `redact`, and there is no built-in key list. In production, name the keys this app's secrets sit under with `redactKeys`; leave it off locally, where the whole payload helps debugging. Choose it in code: no env var turns it on or off.
+
+```ts
+import { env } from 'cloudflare:workers'
+import { redactKeys, type LoggerOptions } from 'loggercf'
+import { TracedEntrypoint, withQueueMessage } from 'loggercf/workers'
+
+interface Job {
+  orderId: string
+}
+
+// Once, at module scope: on in production, off elsewhere.
+const redact =
+  (env as { ENVIRONMENT?: string }).ENVIRONMENT === 'production' &&
+  redactKeys(['authorization', 'cookie', 'password'])
+
+export default class extends TracedEntrypoint {
+  protected override get [TracedEntrypoint.loggerOptions](): LoggerOptions {
+    return { ...super[TracedEntrypoint.loggerOptions], redact }
+  }
+
+  async queue(batch: MessageBatch<Job>) {
+    for (const message of batch.messages) {
+      await withQueueMessage(batch, message, async () => message.ack(), { redact })
+    }
+  }
+}
+```
+
+- `redactKeys(keys, { censor? })` replaces the whole value under a matching key with `'[REDACTED]'` (or `censor`), whatever its case, at any depth: fields, Context Fields, bindings, `args`, and inside every `Error` (`err`, `errors`, `cause`, nested ones). Only whole keys match: `password` doesn't hide `passwordHint`.
+- It matches keys, never text. Log objects that may hold secrets as fields (`logger.info({ body }, 'm')`), never through `%j` / `%o`, which prints them into `message` as text. A `Map`'s keys are not matched.
+- It runs on every line the logger writes, after `Error` serialization and before `limits`: `request.end`, `span.end`, `<operation> failed` included. It never sees the top-level `time`, `level` or trace IDs.
+- A custom redactor is a `Redactor`: `{ value?(value, path), record?(record) }`. `value` is called for each value before what is inside it, with its path (`['err', 'cause', 'message']`, `['args', '0', 'token']`); return it, or a replacement, which is written as it is. `record` gets the whole line once, as JSON data. Never change a value in place in `value`. What either returns goes through the usual serializer rules.
+- A hook that throws never breaks the log call: the value is `"[Redaction failed: <name>]"`, or the line gets `redactFailed`, with one `WARN` per isolate. A line logged from inside a hook keeps only `time`, `level`, the trace IDs and `redactFailed`.
+- The Workers helpers take `redact` as an option next to `serializeError` (`defaultLoggerFromEnv(mapping, { redact })`), and a `TracedEntrypoint` sets it in its `[TracedEntrypoint.loggerOptions]` getter. The helpers cache their Root Logger by the `redact` object: `redactKeys([...])` gives the same one for the same keys, even inline, but a `Redactor` object literal written in a hook or in the call is a new Root Logger each time.
+
+```ts wrong
+// A new object on every request or message: a new Root Logger each time.
+await withQueueMessage(batch, message, fn, { redact: { value: (v, path) => hide(v, path) } })
+// Key matching can't see into text: the password is printed into `message`.
+logger.info('login %j', { user, password })
+```
+
 ## Wrangler setup
 
 ```jsonc
@@ -549,6 +594,7 @@ await withQueueMessage(batch, message, fn, {
 - `LOG_LEVEL` must be lowercase: one of `trace`, `debug`, `info`, `warn`, `error`, `fatal` or `silent`. `silent` writes nothing at all. Any other value (including `DEBUG` and `SILENT`) falls back to `'info'` and writes one `WARN` per isolate that names the bad value.
 - `LOG_SPAN_LEVEL` (a lowercase level, not `silent`) and `LOG_SPAN_SLOW_MS` (milliseconds, `0` or more) set the Root Logger's Span Defaults. Unset, Spans write at `info` with no Slow Threshold. An invalid value is ignored, with one `WARN` per isolate.
 - `LOG_MAX_STRING_LENGTH` (an integer, `1` or more) and `LOG_MAX_RECORD_BYTES` (an integer, `1024` or more) set the Root Logger's `limits`. Unset, nothing is cut: set them in the production environment's `vars` only. An invalid value is ignored, with one `WARN` per isolate.
+- No var sets `serializeError` or `redact`: they are code (see above).
 - To read other vars, pass a mapping. Each field (`service`, `level`, `environment`, `version`, `spanLevel`, `spanSlowMs`, `maxStringLength`, `maxRecordBytes`) takes a var name or a function of env. Fields you leave out keep their default var. The same mapping goes to `tracedWorker(S, { env })` or `withLogging(C, { env })`, or to a `[TracedEntrypoint.envMapping]` getter on a `TracedEntrypoint` subclass.
 
 ```ts

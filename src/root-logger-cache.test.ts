@@ -3,6 +3,7 @@ import { setFlagsFromString } from 'node:v8'
 import { runInNewContext } from 'node:vm'
 import { _captureEntries, _reset } from './logger'
 import { omitErrorKeys } from './omit'
+import { redactKeys } from './redact'
 import type { ErrorSerializer, Logger, LoggerOptions } from './types'
 import { _resetRootLoggers, cachedRootLogger, envRootLogger } from './workers-shared'
 
@@ -120,4 +121,54 @@ describe('the Root Logger cache and serializeError', () => {
       expect(collected).toBe(20)
     },
   )
+})
+
+describe('the Root Logger cache and redact', () => {
+  beforeEach(() => {
+    _reset()
+    _resetRootLoggers()
+  })
+
+  it('an inline redactKeys gives one Root Logger, however many times it is called', () => {
+    const roots = new Set<Logger>()
+    for (let i = 0; i < 1_000; i++) {
+      roots.add(cachedRootLogger({ ...OPTIONS, redact: redactKeys(['password', 'token']) }))
+      roots.add(envRootLogger({ NAME: 'svc' }, { redact: redactKeys(['Token', 'PASSWORD']) }))
+    }
+    expect(roots.size).toBe(2) // the two option sets differ in environment and version
+  })
+
+  it('redact and serializeError together: each pair is its own Root Logger; false is none', () => {
+    const redact = redactKeys(['password'])
+    const plain = cachedRootLogger(OPTIONS)
+    const redacted = cachedRootLogger({ ...OPTIONS, redact })
+    const both = cachedRootLogger({ ...OPTIONS, redact, serializeError: passThrough })
+    const serialized = cachedRootLogger({ ...OPTIONS, serializeError: passThrough })
+    expect(new Set([plain, redacted, both, serialized]).size).toBe(4)
+    expect(cachedRootLogger({ ...OPTIONS, redact: false })).toBe(plain)
+    expect(cachedRootLogger({ ...OPTIONS, redact, serializeError: passThrough })).toBe(both)
+  })
+
+  it('a new redact object on each call writes one WARN per isolate, past 16 of them', () => {
+    const entries = _captureEntries()
+    for (let i = 0; i < 16; i++) cachedRootLogger({ ...OPTIONS, redact: { value: (v) => v } })
+    expect(entries).toEqual([])
+    for (let i = 0; i < 100; i++) cachedRootLogger({ ...OPTIONS, redact: { value: (v) => v } })
+    expect(entries).toEqual([
+      expect.objectContaining({
+        level: 'WARN',
+        message: 'redact is a new object each call; define it once at module scope',
+        redactObjects: 17,
+      }),
+    ])
+  })
+
+  it('an invalid redact throws, and is not counted', () => {
+    const entries = _captureEntries()
+    for (let i = 0; i < 20; i++)
+      expect(() => cachedRootLogger({ ...OPTIONS, redact: { value: 1 } as never })).toThrow(
+        'redact.value must be a function',
+      )
+    expect(entries).toEqual([])
+  })
 })

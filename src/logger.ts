@@ -12,7 +12,6 @@ import type {
   SpanContext,
   SpanDefaults,
   SpanOptions,
-  LineLimits,
 } from './types'
 import { resolveTrace, generateSpanId, toCarrier } from './trace'
 import {
@@ -30,6 +29,7 @@ import {
   withLineOptions,
   workersSink,
   type LineOptions,
+  type LineRedactor,
   type LogRecord,
   type Sink,
 } from './output'
@@ -121,18 +121,15 @@ function checkSpanDefaults(spans: SpanDefaults | undefined): SpanDefaults {
 }
 
 /**
- * Validate the `serializeError` and `limits` Logger Options, as `createLogger` validates `level`.
+ * Validate the `serializeError`, `limits` and `redact` Logger Options, as `createLogger` validates `level`.
  *
- * @param {LoggerOptions['serializeError']} serializeError - The option.
- * @param {LineLimits | undefined} limits - The option.
+ * @param {LoggerOptions} options - The Logger Options.
  * @returns {LineOptions | undefined} The options that are set, or `undefined` when none is.
- * @throws {TypeError} When `serializeError` is not a function.
+ * @throws {TypeError} When `serializeError` is not a function, or `redact` is not a `Redactor` or `false`.
  * @throws {Error} `invalid limits.maxStringLength <value>`, or `invalid limits.maxRecordBytes <value>`.
  */
-function checkLineOptions(
-  serializeError: LoggerOptions['serializeError'],
-  limits: LineLimits | undefined,
-): LineOptions | undefined {
+function checkLineOptions(options: LoggerOptions): LineOptions | undefined {
+  const { serializeError, limits } = options
   if (serializeError !== undefined && typeof serializeError !== 'function')
     throw new TypeError('serializeError must be a function')
   const { maxStringLength, maxRecordBytes } = limits ?? {}
@@ -140,11 +137,66 @@ function checkLineOptions(
     throw new Error(`invalid limits.maxStringLength ${maxStringLength}`)
   if (maxRecordBytes !== undefined && !isMaxRecordBytes(maxRecordBytes))
     throw new Error(`invalid limits.maxRecordBytes ${maxRecordBytes}`)
-  const options: LineOptions = {}
-  if (serializeError) options.serializeError = serializeError
-  if (maxStringLength !== undefined) options.maxStringLength = maxStringLength
-  if (maxRecordBytes !== undefined) options.maxRecordBytes = maxRecordBytes
-  return Object.keys(options).length > 0 ? options : undefined
+  const redact = lineRedactor(options)
+  const line: LineOptions = {}
+  if (serializeError) line.serializeError = serializeError
+  if (maxStringLength !== undefined) line.maxStringLength = maxStringLength
+  if (maxRecordBytes !== undefined) line.maxRecordBytes = maxRecordBytes
+  if (redact) line.redact = redact
+  return Object.keys(line).length > 0 ? line : undefined
+}
+
+/** Whether the WARN for a redactor hook that failed has been written in this isolate. */
+let warnedRedactFailure = false
+
+/**
+ * The `redact` Logger Option, checked, as a line uses it (see `LineRedactor`):
+ * its hooks read once, and a `failed()` that writes one WARN per isolate.
+ *
+ * @param {LoggerOptions} options - The Logger Options.
+ * @returns {LineRedactor | undefined} The redactor, or `undefined` when `redact` is off or has no hook.
+ * @throws {TypeError} When `redact` is not a `Redactor` or `false`, or a hook is not a function.
+ */
+function lineRedactor(options: LoggerOptions): LineRedactor | undefined {
+  const { redact } = options
+  if (redact === undefined || redact === false) return undefined
+  if (typeof redact !== 'object' || redact === null)
+    throw new TypeError('redact must be a Redactor ({ value?, record? }) or false')
+  const { value, record } = redact
+  if (value !== undefined && typeof value !== 'function')
+    throw new TypeError('redact.value must be a function')
+  if (record !== undefined && typeof record !== 'function')
+    throw new TypeError('redact.record must be a function')
+  if (!value && !record) return undefined
+  const { service, environment, version } = options
+  const line: LineRedactor = {
+    redactor: redact,
+    failed(hook, reason, path) {
+      if (warnedRedactFailure) return
+      warnedRedactFailure = true
+      // Straight to the sink: no Context Fields, no bindings, nothing a redactor was to hide.
+      const warning: LogRecord = { time: new Date().toISOString(), level: 'WARN', service }
+      if (environment) warning.environment = environment
+      if (version) warning.version = version
+      warning.message =
+        hook === 'value'
+          ? 'redact value() failed; the value is written as "[Redaction failed: <name>]"'
+          : 'redact record() failed; the line is written as value() left it, with redactFailed'
+      warning.redactHook = hook
+      warning.redactError = reason
+      if (path) warning.redactPath = [...path]
+      const trace = als.getStore()?.trace
+      if (trace) applyTrace(warning, trace)
+      try {
+        sink.write(warning)
+      } catch {
+        // Nowhere to write it: the line itself is still written.
+      }
+    },
+  }
+  if (value) line.value = value
+  if (record) line.record = record
+  return line
 }
 
 /**
@@ -279,8 +331,9 @@ function makeLogger<T extends LogFields = LogFields>(
  *
  * `serializeError` writes every `Error` on its lines, at any depth (see
  * `omitErrorKeys()`), and `limits` bounds each line: `maxStringLength` cuts
- * long strings, and `maxRecordBytes` trims a large line to fit. Both are off
- * by default, and every `.child()` keeps them.
+ * long strings, and `maxRecordBytes` trims a large line to fit. `redact`
+ * redacts each line before the limits apply (see `Redactor` and
+ * `redactKeys()`). All are off by default, and every `.child()` keeps them.
  *
  * @template T - The type of user-defined log fields.
  * @param {LoggerOptions} options - Logger Options. `level` defaults to `'info'`.
@@ -288,7 +341,8 @@ function makeLogger<T extends LogFields = LogFields>(
  * @returns {Logger<T>} The Root Logger.
  * @throws {Error} For an unknown `level` or `spans.level`, a `spans.slowMs` that is not a number `>= 0`,
  *   a `serializeError` that is not a function, a `limits.maxStringLength` that is not an integer `>= 1`,
- *   or a `limits.maxRecordBytes` that is not an integer `>= 1024`.
+ *   a `limits.maxRecordBytes` that is not an integer `>= 1024`, or a `redact` that is neither a
+ *   `Redactor` nor `false`.
  *
  * @example
  * ```ts
@@ -302,7 +356,7 @@ export function createLogger<T extends LogFields = LogFields>(
   options: LoggerOptions,
   bindings?: Partial<T>,
 ): Logger<T> {
-  const { service, level, environment, version, spans, serializeError, limits } = options
+  const { service, level, environment, version, spans } = options
   return makeLogger<T>(
     levelValue(level ?? 'info'),
     {
@@ -312,7 +366,7 @@ export function createLogger<T extends LogFields = LogFields>(
       ...copyBindings(bindings),
     },
     checkSpanDefaults(spans),
-    checkLineOptions(serializeError, limits),
+    checkLineOptions(options),
   )
 }
 
@@ -995,5 +1049,6 @@ export function _reset(): void {
   defaultLogger = undefined
   warnedOutsideContext = false
   warnedOperations.clear()
+  warnedRedactFailure = false
   _resetEnvWarnings()
 }

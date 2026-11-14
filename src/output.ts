@@ -1,4 +1,4 @@
-import type { ErrorSerializer, LogFields, TraceContext } from './types'
+import type { ErrorSerializer, LogFields, Redactor, TraceContext } from './types'
 import { cutString, fitLine, PROTECTED_KEYS } from './limits'
 
 /**
@@ -762,6 +762,26 @@ export interface LineOptions {
   maxStringLength?: number
   /** A line longer than this, in UTF-8 bytes, is trimmed to fit (see `fitLine()`). */
   maxRecordBytes?: number
+  /** Redacts the line before the limits apply (see `writeRedacted()`). */
+  redact?: LineRedactor
+}
+
+/**
+ * The Logger Options' `redact`, as a line uses it: its hooks, read once when
+ * the logger is built, and what to do when one fails.
+ */
+export interface LineRedactor {
+  /** The `Redactor`, the `this` of each hook. */
+  redactor: Redactor
+  /** Its `value()` hook, if it has one. */
+  value?: (value: unknown, path: readonly string[]) => unknown
+  /** Its `record()` hook, if it has one. */
+  record?: (record: Record<string, unknown>) => Record<string, unknown>
+  /**
+   * Called after a hook failed (the line is written anyway): writes the one
+   * WARN per isolate. Never throws.
+   */
+  failed(hook: 'value' | 'record', reason: string, path?: readonly string[]): void
 }
 
 /**
@@ -973,6 +993,144 @@ interface Walk {
   maxString: number
   /** The record being written, when `maxString` is set. */
   record?: LogRecord
+  /** The redactor whose `value()` this walk calls, when it has one (see `redactsHere()`). */
+  redact?: LineRedactor
+  /** The keys from the top of the line to the current value, while `redact` is set. */
+  path?: string[]
+  /** How many redactor replacements the current value is inside: `value()` is not called there. */
+  unredacted: number
+}
+
+/**
+ * The top-level keys a redactor is never given: loggercf writes them as they
+ * are, and the trace IDs and `level` drive what reads the line.
+ */
+const NEVER_REDACTED: ReadonlySet<string> = new Set(['time', 'level', ...TRACE_KEYS])
+
+/**
+ * How many redactor hooks are running. A line logged from inside one, through
+ * any logger with a `redact`, is written as `reenteredLine()`, so a hook that
+ * logs can't call itself again and again, and can't write what it hides.
+ */
+let redacting = 0
+
+/** `redactFailed` on a line logged from inside a redactor hook. */
+export const REDACT_REENTERED = 'logged from inside redact'
+
+/**
+ * The name of what a hook threw, never its message, which may hold the value
+ * it was given: an `Error`'s `name`, or the `typeof` anything else.
+ *
+ * @param {unknown} thrown - What the hook threw.
+ * @returns {string} The name.
+ */
+function failureName(thrown: unknown): string {
+  if (!isError(thrown)) return typeof thrown
+  try {
+    const name: unknown = thrown.name
+    return typeof name === 'string' && name !== '' ? name : 'Error'
+  } catch {
+    return 'Error'
+  }
+}
+
+/**
+ * Why what a hook returned can't be written, when it can't: a thenable (an
+ * `async` hook), or a value whose `then` can't be read (a `Proxy` whose traps
+ * throw). Never throws. A rejected Promise is caught, so it is ours to drop.
+ *
+ * @param {unknown} value - What a hook returned.
+ * @returns {string | undefined} `returned a Promise` (or `a thenable`, `an unreadable value`), or `undefined`.
+ */
+function unwritableResult(value: unknown): string | undefined {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
+  try {
+    if (typeof (value as { then?: unknown }).then !== 'function') return undefined
+    if (!(value instanceof Promise)) return 'returned a thenable'
+    value.catch(() => {})
+    return 'returned a Promise'
+  } catch {
+    return 'returned an unreadable value'
+  }
+}
+
+/**
+ * Whether the walk passes the current value to the redactor's `value()`: it
+ * has one, the value is not inside a replacement it returned, and it is not
+ * the record itself or one of the `NEVER_REDACTED` keys.
+ *
+ * @param {Walk} walk - The current walk.
+ * @returns {boolean} `true` to call `value()`.
+ */
+function redactsHere(walk: Walk): boolean {
+  const { path } = walk
+  return (
+    walk.unredacted === 0 &&
+    path !== undefined &&
+    path.length > 0 &&
+    !(path.length === 1 && NEVER_REDACTED.has(path[0]!))
+  )
+}
+
+/**
+ * The redactor's `value()` for one value, never throwing: a hook that throws,
+ * or returns a Promise, gives `"[Redaction failed: <name>]"`.
+ *
+ * @param {unknown} value - The value, as it will be written.
+ * @param {Walk} walk - The current walk, with `redact` and `path`.
+ * @returns {unknown} What to write: `value` itself, or a replacement.
+ */
+function redactValue(value: unknown, walk: Walk): unknown {
+  const redact = walk.redact!
+  let out: unknown
+  let failed: string | undefined
+  redacting++
+  try {
+    out = redact.value!.call(redact.redactor, value, walk.path!)
+    if (out !== value) failed = unwritableResult(out)
+  } catch (thrown) {
+    failed = failureName(thrown)
+  } finally {
+    redacting--
+  }
+  if (failed === undefined) return out
+  redact.failed('value', failed, walk.path)
+  return `[Redaction failed: ${failed}]`
+}
+
+/**
+ * The `unserializable()` stand-in for a value whose `toJSON` or keys can't be
+ * read, given to the redactor like any value: its reason may hold user data.
+ *
+ * @param {unknown} thrown - What reading the value threw.
+ * @param {string} key - Its key in its parent.
+ * @param {Walk} walk - The current walk.
+ * @returns {unknown} The stand-in, or what the redactor wrote instead.
+ * @throws `NOT_JSON` in a strict walk.
+ */
+function unserializableToJSONValue(thrown: unknown, key: string, walk: Walk): unknown {
+  const text = standIn(walk, unserializable(thrown))
+  if (!walk.redact || !redactsHere(walk)) return text
+  const replaced = redactValue(text, walk)
+  return replaced === text ? text : replacementToJSONValue(replaced, key, walk)
+}
+
+/**
+ * What a redactor returned in place of a value, written by the same rules as
+ * any value, without being redacted again.
+ *
+ * @param {unknown} replaced - The replacement.
+ * @param {string} key - Its key in its parent.
+ * @param {Walk} walk - The current walk.
+ * @returns {unknown} Its JSON-ready value.
+ */
+function replacementToJSONValue(replaced: unknown, key: string, walk: Walk): unknown {
+  walk.unredacted++
+  try {
+    return toJSONValue(replaced, key, walk)
+  } finally {
+    walk.unredacted--
+  }
 }
 
 /**
@@ -1092,10 +1250,20 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   const text = typeof value === 'string' ? value : walkText(value, walk)
   if (walk.inRepeat > 0) charge(walk, key, text)
   if (text !== undefined) {
+    if (walk.redact && redactsHere(walk)) {
+      const replaced = redactValue(text, walk)
+      if (replaced !== text) return replacementToJSONValue(replaced, key, walk)
+    }
     if (text !== value) standIn(walk, text) // a strict walk gives up
     return walk.inRepeat > 0 ? text : stringToJSONValue(text, walk)
   }
-  if (typeof value !== 'object' || value === null) return value
+  if (typeof value !== 'object' || value === null) {
+    if (value !== undefined && walk.redact && redactsHere(walk)) {
+      const replaced = redactValue(value, walk)
+      if (replaced !== value) return replacementToJSONValue(replaced, key, walk)
+    }
+    return value
+  }
   const object = value
 
   if (walk.ancestors.has(object)) return standIn(walk, '[Circular]')
@@ -1106,7 +1274,7 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
       toJSON = (object as { toJSON?: unknown }).toJSON
     } catch (thrown) {
       // An `Error` whose reads throw (a `Proxy`) is still written as one, as at the top level.
-      if (!isError(object)) return standIn(walk, unserializable(thrown))
+      if (!isError(object)) return unserializableToJSONValue(thrown, key, walk)
     }
     if (typeof toJSON === 'function') {
       // On the path while its result is written, so a result that refers back is a cycle.
@@ -1116,7 +1284,7 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
         try {
           replaced = toJSON.call(object, key)
         } catch (thrown) {
-          return standIn(walk, unserializable(thrown))
+          return unserializableToJSONValue(thrown, key, walk)
         }
         if (replaced !== object) {
           const write = () => toJSONValue(replaced, key, walk, false)
@@ -1133,6 +1301,12 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   }
 
   if (isError(object)) return errorToJSONValue(object, key, walk)
+
+  // After `toJSON` and an `Error`'s copy: what the redactor sees is what is written.
+  if (walk.redact && redactsHere(walk)) {
+    const replaced = redactValue(object, walk)
+    if (replaced !== object) return replacementToJSONValue(replaced, key, walk)
+  }
 
   walk.ancestors.add(object)
   // A copy of an `Error`: what is inside it is nested in that `Error`.
@@ -1290,11 +1464,21 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     if (!items && !boxed) keys = Object.keys(object)
     length = items?.length ?? 0
   } catch (thrown) {
-    return standIn(walk, unserializable(thrown))
+    return unserializableToJSONValue(thrown, walk.path?.at(-1) ?? '', walk)
   }
 
-  if (boxed) return toJSONValue(boxed.value, '', walk) // `Object(1n)` as its digits
+  if (boxed) {
+    // `Object(1n)` as its digits. The redactor was given the box: not its primitive again.
+    walk.unredacted++
+    try {
+      return toJSONValue(boxed.value, '', walk)
+    } finally {
+      walk.unredacted--
+    }
+  }
 
+  const { path } = walk
+  const depth = path?.length ?? 0
   if (items) {
     const out: unknown[] = []
     for (let i = 0; i < length; i++) {
@@ -1304,13 +1488,19 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
       } catch (thrown) {
         item = standIn(walk, unserializable(thrown))
       }
-      const converted = toJSONValue(item, String(i), walk) ?? null
+      const index = String(i)
+      if (path) {
+        path.length = depth // a redactor may have changed it
+        path.push(index)
+      }
+      const converted = toJSONValue(item, index, walk) ?? null
       out.push(
         typeof converted === 'string' && converted.length > walk.maxString
           ? cutString(converted, walk.maxString)
           : converted,
       )
     }
+    if (path) path.length = depth
     return out
   }
 
@@ -1322,6 +1512,10 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     } catch (thrown) {
       child = standIn(walk, unserializable(thrown))
     }
+    if (path) {
+      path.length = depth
+      path.push(key)
+    }
     const converted = toJSONValue(child, key, walk)
     if (converted === undefined) continue
     out[key] =
@@ -1331,6 +1525,7 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
         ? cutString(converted, walk.maxString)
         : converted
   }
+  if (path) path.length = depth
   return out
 }
 
@@ -1359,6 +1554,7 @@ const newWalk = (
   budget,
   errors,
   maxString: Infinity,
+  unredacted: 0,
 })
 
 /** Thrown by `stringifyRecord()`'s fast path: the line needs the full walk. */
@@ -1399,7 +1595,9 @@ const MAX_FAST_CHARS = 1024 * 1024
  * A record from a logger with `limits` has them applied here: a string
  * longer than `maxStringLength` is cut on either path, and a line larger
  * than `maxRecordBytes` is trimmed to fit (see `fitLine()`). Its Errors
- * are written by its logger's `serializeError`, when it has one.
+ * are written by its logger's `serializeError`, when it has one. A record
+ * from a logger with `redact` is redacted first (see `writeRedacted()`), so
+ * the limits measure what is written.
  *
  * @param {LogRecord} record - The record to serialize.
  * @returns {string} One JSON line.
@@ -1407,10 +1605,119 @@ const MAX_FAST_CHARS = 1024 * 1024
  */
 export function stringifyRecord(record: LogRecord): string {
   const options = (record as WithLineOptions)[LINE_OPTIONS]
-  const line = writeRecord(record, options)
+  const line = options?.redact
+    ? writeRedacted(record, options, options.redact)
+    : writeRecord(record, options)
   return options?.maxRecordBytes === undefined
     ? line
     : fitLine(line, record, options.maxRecordBytes)
+}
+
+/**
+ * `writeRecord()` for a logger with `redact`: always the walk, which builds
+ * the line's JSON-ready copy in the same pass that calls `value()` on each
+ * value, before what is inside it (see `toJSONValue()`), and cuts what
+ * `value()` returned to `maxStringLength`. With a `record()` hook, the copy is
+ * built uncut, handed to it (see `recordHook()`), and its result written by
+ * `writeRecord()`: the rules of any value, then the cuts. Never throws for a
+ * hook.
+ *
+ * @param {LogRecord} record - The record to serialize.
+ * @param {LineOptions} options - Its logger's options.
+ * @param {LineRedactor} redact - Its logger's redactor.
+ * @returns {string} One JSON line, before `maxRecordBytes`.
+ */
+function writeRedacted(record: LogRecord, options: LineOptions, redact: LineRedactor): string {
+  if (redacting > 0) return JSON.stringify(reenteredLine(record))
+  const budget = lineBudgets.get(record) ?? newBudget()
+  const errors =
+    (record as WithLineErrors)[LINE_ERRORS] ?? newSerializedErrors(options.serializeError)
+  const walk = newWalk(false, budget, undefined, errors)
+  if (redact.value) {
+    walk.redact = redact
+    walk.path = []
+  }
+  const maxString = options.maxStringLength ?? Infinity
+  if (!redact.record) {
+    if (maxString !== Infinity) {
+      walk.maxString = maxString
+      walk.record = record
+    }
+    return JSON.stringify(toJSONValue(record, '', walk, false))
+  }
+  // Built uncut: `record()` sees whole strings, and its result is cut once.
+  const copy = toJSONValue(record, '', walk, false) as LogRecord
+  return writeRecord(recordHook(copy, redact), options)
+}
+
+/**
+ * The line logged from inside a redactor hook: only the keys a redactor is
+ * never given, and `redactFailed`.
+ *
+ * @param {LogRecord} record - The record.
+ * @returns {LogRecord} The line.
+ */
+function reenteredLine(record: LogRecord): LogRecord {
+  const line: LogRecord = {}
+  for (const key of ['time', 'level'] as const)
+    if (typeof record[key] === 'string') line[key] = record[key]
+  line.redactFailed = REDACT_REENTERED
+  for (const key of TRACE_KEYS) if (typeof record[key] === 'string') line[key] = record[key]
+  return line
+}
+
+/**
+ * What a `record()` hook returned, when it is not a plain object, in words.
+ *
+ * @param {unknown} result - What it returned.
+ * @returns {string} `undefined`, `null`, `an array`, `an object that is not plain`, `a string`, ...
+ * @throws When `result` can't be told apart (a `Proxy` whose traps throw).
+ */
+function kindOf(result: unknown): string {
+  if (result === undefined || result === null) return String(result)
+  if (Array.isArray(result)) return 'an array'
+  if (typeof result === 'object') return 'an object that is not plain'
+  return `a ${typeof result}`
+}
+
+/**
+ * Hand the line's JSON-ready copy to the redactor's `record()`, and put back
+ * the keys it is never given (`NEVER_REDACTED`), where they were. Never
+ * throws: when it throws, or returns anything but a plain object (a Promise
+ * included), the copy it was given is kept, as it is then, with
+ * `redactFailed`.
+ *
+ * @param {LogRecord} copy - The line's copy, from the walk.
+ * @param {LineRedactor} redact - The redactor, which has a `record()`.
+ * @returns {LogRecord} The line to write.
+ */
+function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
+  const given: LogRecord = Object.create(null)
+  for (const key of Object.keys(copy)) if (!NEVER_REDACTED.has(key)) given[key] = copy[key]
+  let entries: [string, unknown][] | undefined
+  let failed: string | undefined
+  redacting++
+  try {
+    const result: unknown = redact.record!.call(redact.redactor, given)
+    const unwritable = unwritableResult(result)
+    if (unwritable !== undefined) failed = `record() ${unwritable}`
+    else if (!isPlainObject(result)) failed = `record() returned ${kindOf(result)}`
+    else entries = readEntries(result)
+  } catch (thrown) {
+    failed = `record() threw ${failureName(thrown)}`
+  } finally {
+    redacting--
+  }
+  if (failed !== undefined) {
+    redact.failed('record', failed)
+    entries = readEntries(given)
+  }
+  const line: LogRecord = Object.create(null)
+  for (const key of ['time', 'level'] as const) if (key in copy) line[key] = copy[key]
+  for (const [key, value] of entries!) if (!NEVER_REDACTED.has(key)) line[key] = value
+  if (failed !== undefined) line.redactFailed = failed
+  for (const key of TRACE_KEYS) if (key in copy) line[key] = copy[key]
+  return line
 }
 
 /**

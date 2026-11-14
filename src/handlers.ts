@@ -43,7 +43,7 @@ export type HandlerOptions<E = Cloudflare.Env> = RootLoggerSource<E>
  * the Default Logger unless one is already set (first seen wins).
  *
  * @param {unknown} env - The Worker's env.
- * @param {RootLoggerSource<any>} source - The helper's `env` and `serializeError` options.
+ * @param {RootLoggerSource<any>} source - The helper's `env`, `serializeError` and `redact` options.
  * @returns {Logger} The Root Logger.
  */
 function registeredEnvRootLogger(env: unknown, source: RootLoggerSource<any>): Logger {
@@ -96,8 +96,8 @@ export function withScheduled<E = Cloudflare.Env, R = void | Promise<void>>(
   handler: (controller: ScheduledController, env: E, ctx: ExecutionContext) => R,
   options: HandlerOptions<E> = {},
 ): (controller: ScheduledController, env: E, ctx: ExecutionContext) => R {
-  const { env: mapping, serializeError } = options
-  const source: RootLoggerSource<E> = { env: mapping, serializeError }
+  const { env: mapping, serializeError, redact } = options
+  const source: RootLoggerSource<E> = { env: mapping, serializeError, redact }
   return function scheduled(this: unknown, controller, env, ctx) {
     return runLogged(
       {
@@ -222,12 +222,12 @@ const workflowClasses = new WeakMap<object, RootLoggerSource<any>>()
  * Nothing about the Workflow changes: no step is added, the event, `step` and the
  * return value pass through as they are, and a throw is rethrown unchanged. `run`
  * must be a method on the class (not a class field), and the returned class should
- * be the one exported. Wrapping the result again with the same `env` and
- * `serializeError` returns it; other options, or a subclass of it, throw.
+ * be the one exported. Wrapping the result again with the same `env`,
+ * `serializeError` and `redact` returns it; other options, or a subclass of it, throw.
  *
  * @template C - The Workflow class.
  * @param {C} Class - A `WorkflowEntrypoint` subclass.
- * @param {HandlerOptions} [options] - `env`: the Env Mapping for the Root Logger; `serializeError`: its `serializeError`.
+ * @param {HandlerOptions} [options] - `env`: the Env Mapping for the Root Logger; `serializeError` and `redact`: its `serializeError` and `redact`.
  * @returns A subclass of `Class` whose `run` runs in a Logging Context.
  *
  * @example
@@ -263,8 +263,8 @@ export function withWorkflow<C extends WorkflowClass>(
     )
   }
 
-  const { env: mapping, serializeError } = options
-  const source: RootLoggerSource<any> = { env: mapping, serializeError }
+  const { env: mapping, serializeError, redact } = options
+  const source: RootLoggerSource<any> = { env: mapping, serializeError, redact }
   /** The Root Logger for one Workflow instance, from its env. */
   const instanceRootLogger = (target: object) =>
     envRootLogger((target as { env: unknown }).env, source)
