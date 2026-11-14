@@ -154,12 +154,18 @@ interface Entries {
   /** An object's keys, in order; `undefined` for an array. */
   keys: string[] | undefined
   /** The bytes of each item, or of each key's value, as measured before any is trimmed. */
-  values: number[]
+  valueBytes: number[]
+  /** The largest of `valueBytes`. A value only gets smaller, so none is ever larger. */
+  largest: number
 }
 
 /** What `sizeOf()` measured so far, so nothing is measured twice. */
 interface Sizes {
-  /** The bytes of each container larger than `MIN_TRIMMABLE`, and of each long string (see `LONG_TEXT`). */
+  /**
+   * The bytes of each container larger than `MIN_TRIMMABLE` and each long
+   * string (see `LONG_TEXT`), as `sizeOf()` measured them, and of each
+   * container `shrink()` trimmed inside, as it left it.
+   */
   bytes: Map<unknown, number>
   /** The `Entries` of each wide container (see `WIDE`): reading the keys of a wide object again would cost. */
   entries: Map<object, Entries>
@@ -193,34 +199,73 @@ function sizeOf(value: unknown, sizes: Sizes): number {
     }
     return bytes
   }
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value).length : 4
+  if (typeof value === 'number') return numberBytes(value)
   if (typeof value !== 'object' || value === null) return String(value).length
   const known = sizes.bytes.get(value)
   if (known !== undefined) return known
   let bytes = 2
   let keys: string[] | undefined
-  let values: number[] | undefined
+  let valueBytes: number[] | undefined
+  let largest = 0
   if (Array.isArray(value)) {
-    if (value.length >= WIDE) values = []
-    for (const item of value) {
-      const size = sizeOf(item, sizes)
-      values?.push(size)
+    const { length } = value
+    if (length >= WIDE) valueBytes = []
+    for (let i = 0; i < length; i++) {
+      const size = sizeOf(value[i], sizes)
+      if (valueBytes) {
+        valueBytes.push(size)
+        if (size > largest) largest = size
+      }
       bytes += size + 1
     }
-    if (value.length > 0) bytes--
+    if (length > 0) bytes--
   } else {
     keys = Object.keys(value)
-    if (keys.length >= WIDE) values = []
+    if (keys.length >= WIDE) valueBytes = []
     for (const key of keys) {
       const size = sizeOf((value as Tree)[key], sizes)
-      values?.push(size)
+      if (valueBytes) {
+        valueBytes.push(size)
+        if (size > largest) largest = size
+      }
       bytes += stringBytes(key) + 1 + size + 1
     }
     if (keys.length > 0) bytes--
   }
-  if (values) sizes.entries.set(value, { keys, values })
+  if (valueBytes) sizes.entries.set(value, { keys, valueBytes, largest })
   if (bytes > MIN_TRIMMABLE) sizes.bytes.set(value, bytes)
   return bytes
+}
+
+/** The powers of ten up to `1e20`, each exact as a number. */
+const POWERS_OF_TEN: readonly number[] = Array.from({ length: 21 }, (_, i) => 10 ** i)
+
+/**
+ * How many digits a whole number below `1e21` is written in.
+ *
+ * @param {number} n - A whole number, 0 or more, below `1e21`.
+ * @returns {number} Its digits.
+ */
+function digitsOf(n: number): number {
+  let digits = 1
+  while (digits < 21 && n >= POWERS_OF_TEN[digits]) digits++
+  return digits
+}
+
+/**
+ * The bytes of a number as `JSON.stringify` writes it, without writing an
+ * integer below `1e21`, which is its digits: an array of many numbers would
+ * cost a string each. `NaN` and `Infinity` are `null`.
+ *
+ * @param {number} n - The number.
+ * @returns {number} Its bytes.
+ */
+function numberBytes(n: number): number {
+  if (!Number.isInteger(n)) return Number.isFinite(n) ? String(n).length : 4
+  const magnitude = n < 0 ? -n : n
+  if (magnitude >= 1e21) return String(n).length
+  // `-0` is written `0`.
+  return n < 0 ? digitsOf(magnitude) + 1 : digitsOf(magnitude)
 }
 
 /**
@@ -235,8 +280,8 @@ function sizeOf(value: unknown, sizes: Sizes): number {
  * @returns {number} Its bytes.
  */
 function entrySize(value: unknown, i: number, entries: Entries | undefined, sizes: Sizes): number {
-  const kept = entries?.values[i]
-  return kept !== undefined && kept <= MIN_TRIMMABLE ? kept : sizeOf(value, sizes)
+  const measured = entries?.valueBytes[i]
+  return measured !== undefined && measured <= MIN_TRIMMABLE ? measured : sizeOf(value, sizes)
 }
 
 /**
@@ -374,35 +419,51 @@ const isProtected = (kind: NodeKind, key: string): boolean =>
 const staysInTail = (kind: NodeKind, key: string): boolean =>
   isProtected(kind, key) || (kind === 'root' && key === 'err')
 
+/** The entries a tail pass takes off the end of a container (see `tailToDrop()`). */
+interface Tail {
+  /** The index of the first one taken. Every later one is taken too, but the ones that stay. */
+  from: number
+  /** How many it takes. */
+  taken: number
+  /** Their bytes in the line, their separators excluded. */
+  bytes: number
+  /** What the container loses by it, with the marker put in; `0` or less when it saves nothing. */
+  saved: number
+}
+
 /**
  * The entries at the end of a container that a tail pass takes, to put one
  * marker in their place.
  *
  * @param {number} count - How many entries the container has.
  * @param {(i: number) => number | undefined} take - Takes the entry at `i` and returns its bytes in the line (its separator excluded), or `undefined` when it stays.
- * @param {(taken: number, bytes: number) => number} marker - The bytes of the marker entry, for that many entries taken.
+ * @param {(taken: number, bytes: number) => number} marker - The bytes of the marker entry, for that many entries taken. It should not write the marker.
+ * @param {number} least - The fewest bytes `marker` ever returns: until the tail could save `need` with a marker that small, `marker` is not called.
  * @param {number} need - How many bytes to take out.
- * @returns {{ taken: number[]; bytes: number; saved: number }} The indexes taken, last first, their bytes, and what the container loses by it.
+ * @returns {Tail} What it takes.
  */
 function tailToDrop(
   count: number,
   take: (i: number) => number | undefined,
   marker: (taken: number, bytes: number) => number,
+  least: number,
   need: number,
-): { taken: number[]; bytes: number; saved: number } {
-  const taken: number[] = []
+): Tail {
+  let from = count
+  let taken = 0
   let bytes = 0
-  let saved = 0
   // Without `k` entries and with the marker, the container is `bytes + (k - 1) - marker` bytes smaller.
   for (let i = count - 1; i >= 0; i--) {
     const entry = take(i)
     if (entry === undefined) continue
+    from = i
     bytes += entry
-    taken.push(i)
-    saved = bytes + (taken.length - 1) - marker(taken.length, bytes)
-    if (saved >= need) break
+    taken++
+    if (bytes + (taken - 1) - least < need) continue
+    const saved = bytes + (taken - 1) - marker(taken, bytes)
+    if (saved >= need) return { from, taken, bytes, saved }
   }
-  return { taken, bytes, saved }
+  return { from, taken, bytes, saved: taken === 0 ? 0 : bytes + (taken - 1) - marker(taken, bytes) }
 }
 
 /**
@@ -415,6 +476,9 @@ function tailToDrop(
 const droppedItemsMarker = (items: number, bytes: number): string =>
   `[Trimmed: ${items} items, ${bytes} bytes]`
 
+/** The bytes of a `droppedItemsMarker()` in the line, its quotes included, without its two numbers. */
+const DROPPED_ITEMS_BYTES = droppedItemsMarker(0, 0).length + 2 - 2
+
 /**
  * Take at least `need` bytes off the end of an array of values too small to
  * trim one by one: its last items are replaced with one `droppedItemsMarker()`.
@@ -426,16 +490,19 @@ const droppedItemsMarker = (items: number, bytes: number): string =>
  */
 function dropTail(list: unknown[], need: number, sizes: Sizes): number {
   const entries = sizes.entries.get(list)
-  const { taken, bytes, saved } = tailToDrop(
+  const tail = tailToDrop(
     list.length,
     (i) => entrySize(list[i], i, entries, sizes),
-    (items, removed) => droppedItemsMarker(items, removed).length + 2,
+    (items, removed) => DROPPED_ITEMS_BYTES + digitsOf(items) + digitsOf(removed),
+    DROPPED_ITEMS_BYTES + 2,
     need,
   )
-  if (saved <= 0) return 0
-  list.splice(list.length - taken.length, taken.length, droppedItemsMarker(taken.length, bytes))
+  if (tail.saved <= 0) return 0
+  // An array keeps no item in its tail: every one from `from` on is taken.
+  list.length = tail.from
+  list.push(droppedItemsMarker(tail.taken, tail.bytes))
   sizes.entries.delete(list)
-  return saved
+  return tail.saved
 }
 
 /**
@@ -447,6 +514,9 @@ function dropTail(list: unknown[], need: number, sizes: Sizes): number {
  */
 const droppedKeysMarker = (keys: number, bytes: number): string =>
   `[Trimmed: ${keys} keys, ${bytes} bytes]`
+
+/** The bytes of a `droppedKeysMarker()` in the line, its quotes included, without its two numbers. */
+const DROPPED_KEYS_BYTES = droppedKeysMarker(0, 0).length + 2 - 2
 
 /**
  * Take at least `need` bytes off the end of an object of values too small to
@@ -463,11 +533,11 @@ const droppedKeysMarker = (keys: number, bytes: number): string =>
  */
 function dropTailKeys(node: Tree, need: number, sizes: Sizes, kind: NodeKind): number {
   const entries = sizes.entries.get(node)
-  const keys = entries?.keys ?? Object.keys(node)
+  const keys = keysOf(node, sizes)
   // The shortest of the marker keys that is free, or about to be dropped.
   let markerKey = TRIMMED_KEY
   while (Object.hasOwn(node, markerKey)) markerKey += '_'
-  const { taken, bytes, saved } = tailToDrop(
+  const tail = tailToDrop(
     keys.length,
     (i) => {
       const key = keys[i]
@@ -476,14 +546,18 @@ function dropTailKeys(node: Tree, need: number, sizes: Sizes, kind: NodeKind): n
         markerKey = key
       return stringBytes(key) + 1 + entrySize(node[key], i, entries, sizes)
     },
-    (count, removed) => stringBytes(markerKey) + 1 + droppedKeysMarker(count, removed).length + 2,
+    // A marker key is ASCII JSON does not escape, and `TRIMMED_KEY` or longer: with its quotes and `:`.
+    (count, removed) =>
+      markerKey.length + 3 + DROPPED_KEYS_BYTES + digitsOf(count) + digitsOf(removed),
+    TRIMMED_KEY.length + 3 + DROPPED_KEYS_BYTES + 2,
     need,
   )
-  if (saved <= 0) return 0
-  for (const i of taken) delete node[keys[i]]
-  node[markerKey] = droppedKeysMarker(taken.length, bytes)
+  if (tail.saved <= 0) return 0
+  for (let i = tail.from; i < keys.length; i++)
+    if (!staysInTail(kind, keys[i])) delete node[keys[i]]
+  node[markerKey] = droppedKeysMarker(tail.taken, tail.bytes)
   sizes.entries.delete(node)
-  return saved
+  return tail.saved
 }
 
 /**
@@ -516,9 +590,10 @@ const replacementBytes = (value: unknown, size: number): number =>
  * values would all end as markers, so they stay and the tail of `node` goes
  * instead. The tail also goes for what is left after the values above
  * `MIN_TRIMMABLE` (see `dropTail()` and `dropTailKeys()`), so the leading
- * values stay whole. Each container is sorted once, and only along one path
- * (the value larger than what is needed), so the work is about linear in the
- * line.
+ * values stay whole. A wide container whose values `sizeOf()` measured all
+ * small (see `Entries.largest`) is not looked through: only its tail goes.
+ * Each container is sorted once, and only along one path (the value larger
+ * than what is needed), so the work is about linear in the line.
  *
  * @param {Tree | unknown[]} node - A container. Mutated.
  * @param {number} need - How many bytes to take out.
@@ -527,27 +602,32 @@ const replacementBytes = (value: unknown, size: number): number =>
  * @returns {number} How many bytes it took out.
  */
 function shrink(node: Tree | unknown[], need: number, sizes: Sizes, kind: NodeKind): number {
-  const keys = Array.isArray(node) ? node.map((_, i) => String(i)) : keysOf(node, sizes)
-  const kept = sizes.entries.get(node)
-  const entries: [string, number][] = []
-  // What replacing every value above `MIN_TRIMMABLE` could take out.
+  const entries = sizes.entries.get(node)
+  // The values above `MIN_TRIMMABLE`, the only ones trimmed on their own, with their sizes.
+  const trimmable: [string | number, number][] = []
+  // What replacing every one of them could take out.
   let reachable = 0
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i]
-    if (isProtected(kind, key)) continue
-    const value = (node as Tree)[key]
-    const size = entrySize(value, i, kept, sizes)
-    // A smaller one is never trimmed on its own: the loop below stops at the first.
-    if (size <= MIN_TRIMMABLE) continue
-    entries.push([key, size])
-    reachable += size - replacementBytes(value, size)
+  // A wide container whose values are all small has none: its tail goes, below.
+  if (entries === undefined || entries.largest > MIN_TRIMMABLE) {
+    // An array's items are read by index: a key for each would cost on a wide one.
+    const keys = Array.isArray(node) ? undefined : keysOf(node, sizes)
+    const count = keys ? keys.length : (node as unknown[]).length
+    for (let i = 0; i < count; i++) {
+      const key = keys ? keys[i] : i
+      if (keys && isProtected(kind, keys[i])) continue
+      const value = (node as Tree)[key]
+      const size = entrySize(value, i, entries, sizes)
+      if (size <= MIN_TRIMMABLE) continue
+      trimmable.push([key, size])
+      reachable += size - replacementBytes(value, size)
+    }
+    trimmable.sort((a, b) => b[1] - a[1])
   }
-  entries.sort((a, b) => b[1] - a[1])
   const wholesale = reachable >= need
   let saved = 0
-  for (const [key, size] of entries) {
+  for (const [key, size] of trimmable) {
     const left = need - saved
-    if (left <= 0 || size <= MIN_TRIMMABLE) break
+    if (left <= 0) break
     // They can't all be replaced to reach `need`: keep the ones smaller than what is left, and drop the tail.
     if (!wholesale && size <= left) break
     const value = (node as Tree)[key]

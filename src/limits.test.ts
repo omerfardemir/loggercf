@@ -77,9 +77,31 @@ function lastResortTime(n: number): number {
 }
 
 /**
+ * The multi-MB lines `maxRecordBytes` trims from the walk's copy: wide lines
+ * of short values (strings, numbers, keys), whose own walk is quick, so a
+ * measuring pass shows, and a long string.
+ */
+const MULTI_MB: [string, () => Record<string, unknown>][] = [
+  ['a 20 MB string', () => ({ s: 'x'.repeat(20_000_000) })],
+  [
+    '2.2 MB, an array of 100k short strings',
+    () => ({ list: Array.from({ length: 100_000 }, (_, i) => `item-${i}-zzzzzzzz`) }),
+  ],
+  [
+    '1.1 MB, an array of 150k numbers',
+    () => ({ list: Array.from({ length: 150_000 }, (_, i) => i * 7) }),
+  ],
+  [
+    '1.5 MB, 100k keys',
+    () => Object.fromEntries(Array.from({ length: 100_000 }, (_, i) => [`k${i}`, i])),
+  ],
+  ['1.6 MB of 60-byte fields', () => flatFields(23_000)],
+]
+
+/**
  * How long a line of `fields` takes trimmed to 16,384 bytes, over how long it
- * takes written whole: the median of 7 runs of each, taken in turn, so load on
- * the machine slows both alike.
+ * takes written whole by the same logger without `limits`: the median of 9
+ * runs of each, taken in turn, so load on the machine slows both alike.
  *
  * @param {Record<string, unknown>} fields - The fields of the line.
  * @param {boolean} redact - Whether both loggers have a redactor.
@@ -94,7 +116,7 @@ function trimRatio(fields: Record<string, unknown>, redact: boolean): number {
   run(whole) // warm up
   run(trimmed)
   const times: [number[], number[]] = [[], []]
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 9; i++) {
     times[0].push(run(whole))
     times[1].push(run(trimmed))
   }
@@ -818,6 +840,15 @@ const SHAPES: [string, () => Record<string, unknown>][] = [
     }),
   ],
   [
+    'numbers of every length: integers up to 1e21 and past it, fractions, negatives',
+    () => ({
+      list: Array.from({ length: 3_000 }, (_, i) => {
+        const n = [10 ** (i % 23), 10 ** (i % 23) - 1, 1.5 * 10 ** (i % 30), 2 ** (i % 70), 5e-324]
+        return (i % 2 ? -1 : 1) * n[i % 5]
+      }),
+    }),
+  ],
+  [
     'numbers JSON writes as null, and -0',
     () => ({
       list: Array.from({ length: 3_000 }, (_, i) => [NaN, Infinity, -Infinity, -0, i / 7][i % 5]),
@@ -836,7 +867,7 @@ const SHAPES: [string, () => Record<string, unknown>][] = [
 ]
 
 /**
- * A record of `fields`, with the keys loggercf writes on every line.
+ * A record of `fields`, after Protected Fields: `time`, `level`, `message`, the trace IDs and `service`.
  *
  * @param {Record<string, unknown>} fields - The fields.
  * @returns {Record<string, unknown>} The record.
@@ -860,8 +891,19 @@ const PATHS: [string, () => Record<string, unknown>, boolean][] = [
   ['the walk, for a repeat', () => ({ a: nestedFields(500), b: 'x', c: SHARED, d: SHARED }), false],
   ['the walk, for an Error', () => ({ ctx: new Error('inner'), rows: nestedFields(500) }), false],
   ['the walk, for its size', () => ({ s: 'x'.repeat(1_200_000), rows: nestedFields(200) }), false],
-  // Written before it is measured: nothing tells the walk it is large.
+  // At 16,384 bytes written before it is measured: what the walk counted is under the limit.
   ['the walk, with a redactor', () => ({ password: 'p', rows: nestedFields(500) }), true],
+  // Measured before it is written: it holds more items than the limit has bytes for.
+  [
+    'the walk, with a redactor, many short values',
+    () => ({ password: 'p', list: Array.from({ length: 20_000 }, (_, i) => i) }),
+    true,
+  ],
+  [
+    'the walk, for an Error, many short strings',
+    () => ({ ctx: new Error('inner'), list: Array.from({ length: 20_000 }, (_, i) => `s${i}`) }),
+    false,
+  ],
   // Measured before it is written: its long strings alone are over the limit.
   [
     'the walk, with a redactor, for a long string',
@@ -939,6 +981,25 @@ describe("limits.maxRecordBytes on the walk's copy", () => {
       }
   })
 
+  it('a dropped tail is measured to the byte: its marker holds what the dropped items took', () => {
+    const items = Array.from(
+      { length: 3_000 },
+      (_, i) => [i, -i * 1001, 10 ** (i % 22), i / 3, `s${i}`, -0, NaN][i % 7],
+    )
+    for (let max = 1024; max <= 8192; max += 97) {
+      const line = fitValue({ list: [...items] }, {}, max)
+      const list = (JSON.parse(line) as { list: unknown[] }).list
+      const kept = list.length - 1
+      const dropped = items.slice(kept)
+      const taken = dropped.reduce((sum: number, item) => sum + JSON.stringify(item).length, 0)
+      expect(list.at(-1)).toBe(`[Trimmed: ${dropped.length} items, ${taken} bytes]`)
+      expect(bytes(line)).toBeLessThanOrEqual(max)
+      // As many leading items as fit: one more, and the line would be over.
+      const more = `${JSON.stringify(items[kept])},`
+      expect(bytes(line) + bytes(more)).toBeGreaterThan(max)
+    }
+  })
+
   it.each(SHAPES)('writes a copy that fits as JSON.stringify does: %s', (_, shape) => {
     const line = JSON.stringify(record(shape()))
     const max = Math.max(1024, bytes(line))
@@ -1012,21 +1073,18 @@ describe('limits are bounded in time', () => {
     expect(lastResortTime(2_000_000) / lastResortTime(500_000)).toBeLessThan(10)
   }, 30_000)
 
-  // Written whole and read back, these took 1.5x to 3.9x as long; now about 0.9x to 1.2x.
-  it.each([
-    ['a 20 MB string', () => ({ s: 'x'.repeat(20_000_000) }), false],
-    ['a 20 MB string, redacted', () => ({ s: 'x'.repeat(20_000_000) }), true],
-    ['1.4 MB of 60-byte fields', () => flatFields(23_000), false],
-    [
-      'a 100k-item array',
-      () => ({ list: Array.from({ length: 100_000 }, (_, i) => ({ i, s: 'ab' })) }),
-      false,
-    ],
-  ] as const)(
-    'an oversized multi-MB line costs about what writing it whole does: %s',
+  // Written whole and read back, these took 1.3x to 3.3x as long; now 0.9x to 1.2x. Under load a
+  // run can go over, so a failing one is measured again: a real regression stays over.
+  it.each(
+    MULTI_MB.flatMap(([name, fields]) => [
+      [name, fields, false],
+      [`${name}, redacted`, fields, true],
+    ]) as [string, () => Record<string, unknown>, boolean][],
+  )(
+    'an oversized multi-MB line costs at most about 1.2x what writing it whole does: %s',
+    { timeout: 60_000, retry: 2 },
     (_, fields, redact) => {
-      expect(trimRatio(fields(), redact)).toBeLessThan(1.4)
+      expect(trimRatio(fields(), redact)).toBeLessThan(1.25)
     },
-    60_000,
   )
 })
