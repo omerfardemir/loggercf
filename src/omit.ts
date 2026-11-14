@@ -6,6 +6,7 @@ import {
   isError,
   isPlainObject,
   readEntries,
+  skippedSerializer,
 } from './output'
 
 /**
@@ -69,7 +70,8 @@ function keysKey(keys: readonly string[]): string {
  * `defaultSerialize` it is given leaves them out too, for any other `Error`
  * it serializes that way. When it throws, or returns anything but an object
  * (or a Promise), the `Error` is written in its default shape, without the
- * keys, and with `serializeErrorFailed`. Each call with a `serializer` gives
+ * keys, and with `serializeErrorFailed`; one that returned a Promise is not
+ * called again. Each call with a `serializer` gives
  * a new function: make it once, at module scope.
  *
  * @param {readonly string[]} keys - The own keys to leave out.
@@ -151,13 +153,16 @@ function omitting(keys: readonly string[], serializer?: ErrorSerializer): ErrorS
     // `err` itself is left out of afterwards, so its `omitted` lists what this call removed.
     const omittingDefault = (e: Error) =>
       e === err ? defaultSerialize(e) : without(e, defaultSerialize(e), defaultSerialize)
-    let failed: string | undefined
-    try {
-      const result = serializer(err, omittingDefault)
-      failed = invalidResult(result)
-      if (failed === undefined) return without(err, result, defaultSerialize)
-    } catch (thrown) {
-      failed = describeFailure(thrown)
+    // One that returned a thenable is not called again (see `thenableSerializers`).
+    let failed = skippedSerializer(serializer)
+    if (failed === undefined) {
+      try {
+        const result = serializer(err, omittingDefault)
+        failed = invalidResult(result, serializer)
+        if (failed === undefined) return without(err, result, defaultSerialize)
+      } catch (thrown) {
+        failed = describeFailure(thrown)
+      }
     }
     return without(err, defaultSerialize(err), defaultSerialize, failed)
   }

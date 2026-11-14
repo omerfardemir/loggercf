@@ -509,25 +509,50 @@ function reenteredCopy(error: Error): LogRecord {
 }
 
 /**
+ * The serializers that returned a thenable (an `async` one), with what they
+ * returned (`serializeError returned a Promise` or `... a thenable`). Its body
+ * keeps running after the first `await`, where nothing marks a line as logged
+ * from inside it, so a serializer that logs there would call itself again and
+ * again. Such a serializer is never called again in this isolate: its Errors
+ * are written in the default shape with that failure, the same text as on the
+ * call that returned the thenable. Weak, so a serializer built per call is
+ * collected.
+ */
+const thenableSerializers = new WeakMap<ErrorSerializer, string>()
+
+/**
  * Why a custom serializer's result can't be written, when it can't: anything
  * but an object, or a thenable (an `async` serializer). Its `Error` is then
- * written as if the serializer threw.
+ * written as if the serializer threw. A thenable also marks `serializer` as one
+ * to call no more (see `skippedSerializer()`).
  *
  * @param {unknown} result - What the serializer returned.
+ * @param {ErrorSerializer} serializer - The serializer that returned it.
  * @returns {string | undefined} `serializeError returned <kind>`, or `undefined` for an object.
  * @throws When `result` is an object whose `then` can't be read (a `Proxy` whose traps throw).
  */
-export function invalidResult(result: unknown): string | undefined {
+export function invalidResult(result: unknown, serializer: ErrorSerializer): string | undefined {
   if (result === null) return 'serializeError returned null'
   if (typeof result === 'object') {
     if (typeof (result as { then?: unknown }).then !== 'function') return undefined
     // A rejected Promise is ours to drop, not an unhandled rejection; another thenable's `then` is user code, left alone.
     if (result instanceof Promise) result.catch(() => {})
-    return `serializeError returned ${result instanceof Promise ? 'a Promise' : 'a thenable'}`
+    const failed = `serializeError returned ${result instanceof Promise ? 'a Promise' : 'a thenable'}`
+    thenableSerializers.set(serializer, failed)
+    return failed
   }
   const kind = typeof result
   return `serializeError returned ${kind === 'undefined' ? 'undefined' : `a ${kind}`}`
 }
+
+/**
+ * Why `serializer` is not called, when an earlier call returned a thenable.
+ *
+ * @param {ErrorSerializer} serializer - The serializer.
+ * @returns {string | undefined} `serializeError returned a Promise` (or `a thenable`), or `undefined` when it may be called.
+ */
+export const skippedSerializer = (serializer: ErrorSerializer): string | undefined =>
+  thenableSerializers.get(serializer)
 
 /**
  * The default shape of `error`, as `defaultSerialize` gives it to a custom
@@ -571,7 +596,9 @@ function shallowCopy(error: Error, cache: SerializedErrors): LogRecord {
  * Budget apply. An `Error` it returns (`error` itself included) is written in
  * its default shape. When it throws, or returns anything but an object (or a
  * thenable, see `invalidResult()`), `error` is written in its default shape,
- * with `serializeErrorFailed` describing the failure. Never throws.
+ * with `serializeErrorFailed` describing the failure. A serializer that
+ * returned a thenable once is not called again (see `thenableSerializers`).
+ * Never throws.
  *
  * @param {Error} error - The `Error`.
  * @param {CustomErrors} custom - The line's custom copies.
@@ -581,16 +608,18 @@ function shallowCopy(error: Error, cache: SerializedErrors): LogRecord {
 function customCopy(error: Error, custom: CustomErrors, cache: SerializedErrors): unknown {
   if (custom.copies.has(error)) return custom.copies.get(error)
   let copy: unknown
-  let failed: string | undefined
-  serializing++
-  try {
-    const result = custom.serialize(error, (e) => defaultCopy(e, custom, cache))
-    failed = invalidResult(result)
-    if (failed === undefined) copy = ownedCopy(result as object, error, custom, cache)
-  } catch (thrown) {
-    failed = describeFailure(thrown)
-  } finally {
-    serializing--
+  let failed = skippedSerializer(custom.serialize)
+  if (failed === undefined) {
+    serializing++
+    try {
+      const result = custom.serialize(error, (e) => defaultCopy(e, custom, cache))
+      failed = invalidResult(result, custom.serialize)
+      if (failed === undefined) copy = ownedCopy(result as object, error, custom, cache)
+    } catch (thrown) {
+      failed = describeFailure(thrown)
+    } finally {
+      serializing--
+    }
   }
   if (failed !== undefined) {
     const out = shallowCopy(error, cache)
@@ -1074,7 +1103,8 @@ function standIn(walk: Walk, text: string): string {
  * `[key, value]` pairs, a `Set` an array; a `BigInt` is its digits, a
  * function `[Function: name]`, a symbol `Symbol(description)` (boxed or
  * not); an `Error` is its `defaultErrorShape()` copy (see `errorToJSONValue()`),
- * unless it has a `toJSON`, which JSON calls first; a real cycle is
+ * unless it has a `toJSON`, which JSON calls first (not under a `serializeError`,
+ * or on a line logged from inside one, where the `Error` is written first); a real cycle is
  * `"[Circular]"` (a `toJSON` result that refers back to
  * its object included); a repeated object (one with a `toJSON` included), or
  * a repeated long string, is written again within the Re-write Budget (see `MAX_REWRITTEN_VALUES` and `MAX_REWRITTEN_CHARS`), then
@@ -1100,7 +1130,9 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
 
   if (walk.ancestors.has(object)) return standIn(walk, '[Circular]')
 
-  if (useToJSON) {
+  // Under a `serializeError` (or inside one) the serializer wins at every depth: an `Error` is
+  // written by it, not by its class's `toJSON`. Without one, nothing is checked but `walk.errors`.
+  if (useToJSON && !(walk.errors && serializerWins(walk.errors) && isError(object))) {
     let toJSON: unknown
     try {
       toJSON = (object as { toJSON?: unknown }).toJSON
@@ -1157,6 +1189,17 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
     if (entered) errors?.ancestors.delete(entered)
   }
 }
+
+/**
+ * Whether an `Error` met in a value is written before its `toJSON` is called:
+ * the line's logger has a `serializeError`, or a line is being logged from
+ * inside one (so its Errors are only `reenteredCopy()`, whatever their class).
+ *
+ * @param {SerializedErrors} errors - The line's cache.
+ * @returns {boolean} `true` when an `Error` goes through `errorCopy()` first.
+ */
+const serializerWins = (errors: SerializedErrors): boolean =>
+  errors.custom !== undefined || serializing > 0
 
 /**
  * The `Error` part of `toJSONValue()`: its copy from `defaultErrorShape()`,
@@ -1425,6 +1468,8 @@ export function stringifyRecord(record: LogRecord): string {
 function writeRecord(record: LogRecord, options: LineOptions | undefined): string {
   const maxString = options?.maxStringLength ?? Infinity
   if (typeof record.toJSON !== 'function') {
+    // Under a `serializeError` (or inside one) an `Error` is written before its `toJSON` is called.
+    const errorsFirst = options?.serializeError !== undefined || serializing > 0
     const seen = new WeakSet<object>()
     let strings: Set<string> | undefined
     let values = 0
@@ -1459,6 +1504,8 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
         if (own !== value && typeof own === 'object' && own !== null) {
           if (seen.has(own)) throw NEEDS_WALK
           seen.add(own)
+          // Native `JSON.stringify` already called its `toJSON`: the walk writes the `Error` instead.
+          if (errorsFirst && isError(own)) throw NEEDS_WALK
         }
         // A plain object or an array, as most are, is none of the values below.
         const prototype: unknown = Object.getPrototypeOf(value)

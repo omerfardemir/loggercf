@@ -482,8 +482,8 @@ const logger = createLogger({
 ```
 
 - `serializeError(err, defaultSerialize)` writes every `Error` on the line, at any depth; `omitErrorKeys(keys, serializer?)` builds one, and lists what it left out as `omitted`. Don't strip keys from an `Error` before logging it, and don't log `err.message` instead of `err`: you lose the stack and `cause`.
-- A serializer that throws, or returns anything but an object (`undefined`, a Promise from an `async` one), never breaks the log call: that `Error` is written the default way, with `serializeErrorFailed`. Keep it synchronous.
-- A line logged from inside the serializer writes each `Error` as only `{ type, message, serializeErrorFailed: 'logged from inside serializeError' }`, so it can't leak the keys being left out.
+- A serializer that throws, or returns anything but an object (`undefined`, a Promise from an `async` one), never breaks the log call: that `Error` is written the default way, with `serializeErrorFailed`. Keep it synchronous: one that returned a Promise is never called again in the isolate.
+- A line logged from inside the serializer writes each `Error` as only `{ type, message, serializeErrorFailed: 'logged from inside serializeError' }`, so it can't leak the keys being left out. The serializer wins at every depth, even over an `Error` class's own `toJSON`.
 - `type` is never left out: it is always the class name.
 - `maxStringLength` cuts longer strings to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a larger line to fit, largest values first, keeping the Protected Fields. Workers Logs caps each log at 256 KB and truncates a larger one, which breaks its JSON; `200_000` leaves room.
 - A Span's `span.error` is the thrown message as a plain string: `serializeError` and `omitErrorKeys(['message'])` don't change it.
