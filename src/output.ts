@@ -263,7 +263,10 @@ interface SerializedError {
  * at an `Error` outside it is reused where the same Errors sit at those
  * depths above it. Anywhere else it may not be right, so it is serialized
  * again instead, while that fits `reserializeBudget`: `"[Circular]"` then
- * marks only a real loop. Past it, the copy is reused as is.
+ * marks only a real loop. Past it, the copy is reused as is. A reused copy
+ * may also hold a copy of an `Error` that is an ancestor where it is reused:
+ * the walk writes that one as `"[Circular]"` (see `toJSONValue()`),
+ * so it costs nothing to serialize again.
  */
 export interface SerializedErrors {
   /** Each depth's copies. */
@@ -1421,6 +1424,17 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
 
   if (isError(object)) return errorToJSONValue(object, key, walk)
 
+  // A copy of an `Error`: what is inside it is nested in that `Error`. A default-shape copy of
+  // an `Error` the walk is already inside is that `Error` nested in itself, so `"[Circular]"`, as
+  // when the walk meets the `Error`. A copy reused at its depth (see `SerializedErrors`) can hold
+  // one: made under other Errors, it may hold a copy of one that is an ancestor where it is reused.
+  // A `serializeError` result is not cut: it may hold `defaultSerialize(err)` of its own `Error`
+  // (see `ownedCopy()`), which is written. The redactor's `value()` is not called on the cut copy.
+  const { errors } = walk
+  const owner = errors?.owners.get(object as LogRecord)
+  const ownerIsAncestor = owner !== undefined && errors!.ancestors.has(owner)
+  if (ownerIsAncestor && errors!.custom === undefined) return standIn(walk, '[Circular]')
+
   // After `toJSON` and an `Error`'s copy: what the redactor sees is what is written.
   if (walk.redact) {
     const replaced = redactedToJSONValue(object, key, walk)
@@ -1428,13 +1442,10 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   }
 
   walk.ancestors.add(object)
-  // A copy of an `Error`: what is inside it is nested in that `Error`.
-  const { errors } = walk
-  const owner = errors?.owners.get(object as LogRecord)
-  // Entered only when `owner` is not an ancestor already: a reused copy can hold
-  // a copy of an `Error` the walk is inside, and that one keeps its depth.
+  // Entered only when `owner` is not an ancestor already: a `serializeError` result
+  // can hold `defaultSerialize(err)` of its own `Error`, which keeps the depth it has.
   let entered: Error | undefined
-  if (errors && owner && !errors.ancestors.has(owner)) {
+  if (errors && owner && !ownerIsAncestor) {
     const depth = errors.ancestors.size
     errors.path[depth] = owner
     errors.ancestors.set(owner, depth)

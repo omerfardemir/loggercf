@@ -188,6 +188,19 @@ describe('serializeError in Logger Options', () => {
     })
   })
 
+  it('a result that holds defaultSerialize of its own Error writes that shape, not "[Circular]"', () => {
+    const entries = _captureEntries()
+    const err = new Error('m', { cause: new Error('c') })
+    createLogger({
+      service: 'svc',
+      serializeError: (e, defaultSerialize) => ({ base: defaultSerialize(e), seen: true }),
+    }).error({ nested: { err } }, 'line')
+    expect((entries[0].nested as Record<string, unknown>).err).toMatchObject({
+      base: { message: 'm', cause: { base: { message: 'c' }, seen: true } },
+      seen: true,
+    })
+  })
+
   it('an Error nested deeper than 5 levels is cut off, as by default', () => {
     const entries = _captureEntries()
     let err: Error = new Error('e9')
