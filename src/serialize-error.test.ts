@@ -38,6 +38,9 @@ const wrapping: ErrorSerializer = (err, defaultSerialize) => ({
   first: err.cause instanceof Error ? defaultSerialize(err.cause) : undefined,
 })
 
+/** An Error with an own `toJSON` function property. */
+const withOwnToJSON = () => Object.assign(new Error('m'), { toJSON: () => ({ custom: 1 }) })
+
 /** A serializer that writes the default shape. */
 const passThrough: ErrorSerializer = (err, defaultSerialize) => defaultSerialize(err)
 
@@ -565,6 +568,21 @@ describe('an Error with a class toJSON, at any depth', () => {
 
 describe('omitErrorKeys', () => {
   beforeEach(() => _reset())
+
+  it('an Error with its own toJSON: defaultSerialize writes it as text, and it can be omitted', () => {
+    const entries = _captureEntries()
+    createLogger({ service: 'svc', serializeError: passThrough }).error(withOwnToJSON())
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['toJSON']) }).error(
+      withOwnToJSON(),
+    )
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['other']) }).error(
+      withOwnToJSON(),
+    )
+    expect(entries[0].err).toMatchObject({ message: 'm', toJSON: '[Function: toJSON]' })
+    expect(entries[1].err).toMatchObject({ message: 'm', omitted: ['toJSON'] })
+    expect(entries[1].err).not.toHaveProperty('toJSON')
+    expect(entries[2].err).toMatchObject({ message: 'm', toJSON: '[Function: toJSON]' })
+  })
 
   it('leaves the given own keys out and lists them as omitted', () => {
     const entries = _captureEntries()
