@@ -52,9 +52,6 @@
     "pack:dry": "npm pack --dry-run",
     "release:check": "pnpm format:check && pnpm lint && pnpm build && pnpm typecheck && pnpm typecheck:dev && pnpm check:skill && pnpm test && pnpm pack:dry && pnpm e2e:local"
   },
-  "dependencies": {
-    "pino": "^10.4.0"
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261112.1",
     "@types/node": "^25.6.0",

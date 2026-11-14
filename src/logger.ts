@@ -1,7 +1,7 @@
-import pino from 'pino/browser.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type {
   LogFields,
+  LogLevel,
   LogValue,
   LoggerOptions,
   Logger,
@@ -12,14 +12,20 @@ import type {
 } from './types'
 import { resolveTrace, generateSpanId, toCarrier } from './trace'
 import {
+  applyTrace,
   buildRecord,
+  newBudget,
+  copyBindings,
+  describeFailure,
   nodeSink,
   stringifyRecord,
+  takeRecordKeys,
   workersSink,
   type LogRecord,
   type Sink,
 } from './output'
 import { _resetEnvWarnings } from './env'
+import { routeArgs } from './route'
 
 const als = new AsyncLocalStorage<ALSStore>()
 
@@ -36,60 +42,133 @@ const IS_WORKERS = typeof navigator !== 'undefined' && navigator.userAgent === '
  */
 let sink: Sink = IS_WORKERS ? workersSink : nodeSink
 
-const LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const
+/** Severity of each level, lowest first. A logger writes levels at or above its minimum. */
+const LEVEL_VALUES: Record<LogLevel, number> = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60,
+}
+
+const LEVELS = Object.keys(LEVEL_VALUES) as LogLevel[]
 
 /**
- * Wrap a pino instance in the public `Logger` interface.
+ * The numeric minimum for a level name. `'silent'` (not a `LogLevel`, but
+ * accepted by earlier loggercf versions) writes nothing, so existing configs keep working.
  *
- * Normalizes a bare `Error` first argument (`logger.error(err, msg?)`) into
- * `{ err }` with `msg` defaulting to `err.message`, because pino's object mode
- * would otherwise drop the error entirely.
- *
- * @template T - The type of user-defined log fields.
- * @param {pino.Logger} p - The pino instance to wrap.
- * @returns {Logger<T>} The Logger.
+ * @param {string} level - A level name.
+ * @returns {number} Its severity.
+ * @throws {Error} `unknown level <name>` for anything else.
  */
-function wrap<T extends LogFields = LogFields>(p: pino.Logger): Logger<T> {
-  const logger = {
-    child: (bindings: Record<string, unknown>) => wrap<T>(p.child(bindings)),
-  } as Logger<T>
-  for (const level of LEVELS) {
-    logger[level] = (...args: unknown[]) => {
-      const [first, msg, ...rest] = args
-      if (first instanceof Error) {
-        ;(p[level] as (...a: unknown[]) => void)({ err: first }, msg ?? first.message, ...rest)
-        return
-      }
-      ;(p[level] as (...a: unknown[]) => void)(...args)
-    }
+function levelValue(level: string): number {
+  if (level === 'silent') return Infinity
+  if (!Object.hasOwn(LEVEL_VALUES, level)) throw new Error(`unknown level ${level}`)
+  return LEVEL_VALUES[level as LogLevel]
+}
+
+const noop = () => {}
+
+/**
+ * Build one log line: route the arguments, add time, level and bindings, then
+ * hand it to `buildRecord()` and the current sink.
+ *
+ * Order of keys: `time`, `level`, Context Fields, bindings, call fields,
+ * `message`, `errors`, `args`, trace IDs.
+ *
+ * @param {string} label - The upper-case level written as `level`.
+ * @param {LogRecord} bindings - The logger's bindings (`createLogger` / `.child()`).
+ * @param {unknown[]} input - The arguments the log method received.
+ */
+function write(label: string, bindings: LogRecord, input: unknown[]): void {
+  const budget = newBudget() // one per line: the message's placeholders, then the record
+  const entry = {
+    time: new Date().toISOString(),
+    level: label,
+    bindings,
+    budget,
+    ...routeArgs(input, budget),
   }
-  return logger
+  sink.write(buildRecord(entry, als.getStore()))
 }
 
 /**
- * Create a pino instance. The same configuration on every runtime: pino's
- * object mode hands each entry to `buildRecord()`, then to the current sink.
+ * `write()`, but a log call never throws. Routing and serialization already
+ * replace a value that cannot be read or serialized with a stand-in, so this
+ * is the last resort, for a failure no single value explains (the sink
+ * throws, a value nested too deep for the stack): a minimal line is written
+ * instead, with `time`, `level`, the trace IDs, bindings, the message
+ * template as given, and `logError` describing the failure. As in
+ * `buildRecord()`, bindings for the Record Keys move to `args`. If even
+ * that fails, the line is written without bindings, then dropped.
  *
- * @param {string} level - The minimum log level.
- * @returns {pino.Logger} A configured pino instance.
+ * @param {string} label - The upper-case level written as `level`.
+ * @param {LogRecord} bindings - The logger's bindings (`createLogger` / `.child()`).
+ * @param {unknown[]} input - The arguments the log method received.
  */
-function createPino(level: string): pino.Logger {
-  return pino({
-    level,
-    messageKey: 'message',
-    timestamp: pino.stdTimeFunctions.isoTime,
-    browser: {
-      asObject: true,
-      formatters: {
-        level(label: string) {
-          return { level: label.toUpperCase() }
-        },
-      },
-      write: (entry: object) => {
-        sink.write(buildRecord(entry as LogRecord, als.getStore()))
-      },
-    },
-  })
+function safeWrite(label: string, bindings: LogRecord, input: unknown[]): void {
+  try {
+    write(label, bindings, input)
+  } catch (thrown) {
+    const template = [input[0], input[1]].find((value) => typeof value === 'string')
+    const trace = als.getStore()?.trace
+    const head: LogRecord = { time: new Date().toISOString(), level: label }
+    if (trace) applyTrace(head, trace)
+    const tail: LogRecord = { logError: `log call failed: ${describeFailure(thrown)}` }
+    if (template !== undefined) tail.message = template
+    /**
+     * The minimal line.
+     *
+     * @param {LogRecord} [extra] - Bindings to include, between `head` and `tail`.
+     * @returns {LogRecord} `head`, `extra`, `tail`; then the trace IDs again, so `extra` cannot replace them.
+     */
+    const minimal = (extra?: LogRecord): LogRecord => {
+      const line: LogRecord = { ...head, ...extra, ...tail }
+      if (trace) applyTrace(line, trace)
+      return line
+    }
+    try {
+      // Like `buildRecord()`: bindings cannot set `time`, `level` or `message`.
+      const moved: LogRecord[] = []
+      const line = minimal(takeRecordKeys(bindings, moved))
+      if (moved.length > 0) line.args = moved
+      sink.write(line)
+    } catch {
+      try {
+        sink.write(minimal())
+      } catch {
+        // Nowhere left to write: a log call must not throw.
+      }
+    }
+  }
+}
+
+/**
+ * Build a `Logger` that writes levels at or above `minimum`, with `bindings`
+ * on every line. Immutable: `child()` returns a new logger with merged bindings.
+ *
+ * @template T - The type of user-defined log fields.
+ * @param {number} minimum - The minimum severity written.
+ * @param {LogRecord} bindings - Fixed fields on every line.
+ * @returns {Logger<T>} The Logger.
+ */
+function makeLogger<T extends LogFields = LogFields>(
+  minimum: number,
+  bindings: LogRecord,
+): Logger<T> {
+  const logger = {
+    child: (more: Record<string, unknown>) =>
+      makeLogger<T>(minimum, { ...bindings, ...copyBindings(more) }),
+  } as Logger<T>
+  for (const level of LEVELS) {
+    const label = level.toUpperCase()
+    logger[level] =
+      LEVEL_VALUES[level] < minimum
+        ? noop
+        : (...args: unknown[]) => safeWrite(label, bindings, args)
+  }
+  return logger
 }
 
 /**
@@ -117,15 +196,12 @@ export function createLogger<T extends LogFields = LogFields>(
   bindings?: Partial<T>,
 ): Logger<T> {
   const { service, level, environment, version } = options
-  const p = createPino(level ?? 'info')
-  return wrap<T>(
-    p.child({
-      service,
-      ...(environment ? { environment } : {}),
-      ...(version ? { version } : {}),
-      ...bindings,
-    }),
-  )
+  return makeLogger<T>(levelValue(level ?? 'info'), {
+    service,
+    ...(environment ? { environment } : {}),
+    ...(version ? { version } : {}),
+    ...copyBindings(bindings),
+  })
 }
 
 /**
@@ -176,14 +252,21 @@ let forwarding = false
  */
 function forwardingLogger(resolve: () => Logger): Logger {
   const logger = {
-    child: (bindings: Record<string, unknown>) => {
+    child: (more: Record<string, unknown>) => {
+      // Read now, as `makeLogger` does: a log call never runs the getters.
+      const bindings = copyBindings(more)
       let base: Logger | undefined
       let child: Logger | undefined
       return forwardingLogger(() => {
         const current = resolve()
         if (current !== base) {
           base = current
-          child = current.child(bindings)
+          try {
+            child = current.child(bindings)
+          } catch {
+            // A hand-written default whose `.child()` throws: keep the line and its fields.
+            child = fallbackLogger().child(bindings)
+          }
         }
         return child!
       })

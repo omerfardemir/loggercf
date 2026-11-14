@@ -133,13 +133,50 @@ export interface LoggerOptions {
 }
 
 /**
- * A single log-level method.
+ * The known (non-index-signature) keys of `T`, all optional. Gives structured
+ * calls autocomplete and type checks for the fields `T` declares.
  *
- * @param {unknown} obj - Structured data to include in the log entry.
- * @param {string} [msg] - Optional message string (supports `printf`-style placeholders).
- * @param {...unknown} args - Substitution values for `msg` placeholders.
+ * @template T - The type of user-defined log fields.
  */
-type LogFn = (obj: unknown, msg?: string, ...args: unknown[]) => void
+type KnownFields<T> = {
+  [K in keyof T as string extends K ? never : number extends K ? never : K]?: T[K]
+}
+
+/**
+ * A single log-level method. Two call styles, which can be mixed:
+ *
+ * - **structured**: `logger.info({ userId }, 'user signed in')`, `logger.error(err, 'failed')`
+ * - **console style**: `logger.info('user signed in', { userId })`, `logger.error('failed', err)`
+ *
+ * The message supports `printf` placeholders (`%s %d %i %f %j %o %O %%`).
+ * No argument is ever dropped: arguments the placeholders don't take are
+ * routed into the record (see the README's "Log Output").
+ *
+ * @template T - The type of user-defined log fields.
+ */
+export interface LogFn<T extends LogFields = LogFields> {
+  /** Console style: a message, then placeholder values, fields, errors or extra words. */
+  (msg: string, ...args: unknown[]): void
+  /** An `Error`, kept under `err`. The message defaults to `err.message`. */
+  (err: Error, msg?: string, ...args: unknown[]): void
+  /** Structured: fields merged at the top level (`err` may be `unknown`), then the message. */
+  <F extends object>(fields: F & KnownFields<T>, msg?: string, ...args: unknown[]): void
+  /**
+   * A message or an `Error` whose static type is a union (`string | Error`,
+   * `Error | undefined`, `Error | null`). An unset `undefined` / `null`
+   * followed by a string writes nothing, and the string is still the message:
+   * `logger.error(maybeErr, 'failed %s', id)`. Alone, or before anything else,
+   * it is a leading primitive: `String(value)` is the message, the value is in
+   * `args`, and the arguments after it are routed as usual.
+   */
+  (value: string | Error | null | undefined, msg?: string, ...args: unknown[]): void
+  /**
+   * A value typed `unknown` or `any`, such as a `catch (e)` binding:
+   * `logger.error(e)`, `logger.error(e, 'failed')`. Only `unknown` and `any`
+   * match this overload, so a wrongly typed value is still rejected.
+   */
+  <E>(value: unknown extends E ? E : never, msg?: string, ...args: unknown[]): void
+}
 
 /**
  * Public logger interface.
@@ -157,17 +194,17 @@ type LogFn = (obj: unknown, msg?: string, ...args: unknown[]) => void
  */
 export interface Logger<T extends LogFields = LogFields> {
   /** Most detailed, fine-grained logs. severity: 10 */
-  trace: LogFn
+  trace: LogFn<T>
   /** Debug-level logs. severity: 20 */
-  debug: LogFn
+  debug: LogFn<T>
   /** Informational logs. severity: 30 */
-  info: LogFn
+  info: LogFn<T>
   /** Warning logs. severity: 40 */
-  warn: LogFn
+  warn: LogFn<T>
   /** Error logs. severity: 50 */
-  error: LogFn
+  error: LogFn<T>
   /** Critical errors causing service failure. severity: 60 */
-  fatal: LogFn
+  fatal: LogFn<T>
 
   /**
    * Create a scoped child logger with extra bindings baked in.

@@ -51,6 +51,9 @@ app.get('/', async (c) => {
   log.warn({ warning: 'test' }, 'Warning with structured data')
   log.error('Error-level log (not a real error)')
 
+  // Demo: console-style call, the extra object becomes top-level fields
+  log.info('Console-style log with %s', 'a placeholder', { style: 'console' })
+
   // Demo: setLoggerContext enriches all subsequent logs
   setLoggerContext({ userId: 'user-42', feature: 'demo' })
   log.info('This log has userId and feature fields attached')

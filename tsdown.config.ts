@@ -13,6 +13,6 @@ export default defineConfig({
   clean: true,
   publint: true,
   deps: {
-    neverBundle: ['pino', 'hono', 'cloudflare:workers', 'node:async_hooks'],
+    neverBundle: ['hono', 'cloudflare:workers', 'node:async_hooks'],
   },
 })

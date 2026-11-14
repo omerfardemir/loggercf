@@ -394,24 +394,39 @@ export { LoggedWelcome as Welcome }
 
 ### Log call shape
 
-The object comes first and the message second. An `Error` is kept under `err` either as the first argument or as `{ err }`. It is serialized with type, message, stack, own fields and `cause`.
+Two call styles work, and no argument is ever dropped. Prefer the structured style (fields or an `Error` first, then the message) for data you want to query. The console style (message first) also keeps every argument: a trailing object's keys become top-level fields, the first trailing `Error` becomes `err`, extra strings and numbers join the message, and anything else goes to an `args` array.
 
 ```ts
 import { createLogger } from 'loggercf'
 
 const logger = createLogger({ service: 'api' })
 const err = new Error('payment declined')
+
+// structured
 logger.error(err)
 logger.error({ err, orderId: 'o-1' }, 'charge failed')
 logger.info({ orderId: 'o-1' }, 'charged')
+
+// console style: same fields on the line
+logger.error('charge failed', err, { orderId: 'o-1' })
+logger.info('charged %s', 'o-1', { amount: 42 })
+
+try {
+  throw new Error('declined')
+} catch (e) {
+  logger.error(e, 'charge failed') // e is unknown: also fine as { err: e } or after the message
+}
 ```
+
+An `Error | undefined` that is unset writes nothing when the message follows it: `logger.error(maybeErr, 'failed %s', id)` gives `failed id1`. Alone, or before anything but a string, it is a leading primitive, like a number: `String(value)` is the message, the value is in `args` (as `null`), and the arguments after it are routed as usual. `logger.error(maybeErr)` gives the message `undefined`, and `logger.info(undefined, { a: 1 })` the message `undefined` with `a: 1` as a field. After a leading object or `Error`, an `undefined` in the message's place lands in `args`.
+
+An `Error` is serialized with type, message, stack, own fields, an `AggregateError`'s `errors`, and `cause`. An `Error` nested inside a field (`{ failures: [e] }`, `{ ctx: { err: e } }`) is written as `{}` for now; pass errors as arguments (`logger.error('m', e1, e2)`) or as a top-level `err`. A value that can't be serialized (a getter or a `toJSON` that throws) becomes `"[Unserializable: <reason>]"` on its own; the rest of the line is kept. `printf` placeholders (`%s %d %i %f %j %o %O %%`) take arguments in order. `%s %d %i %f` don't print an object: the placeholder stays in the text and the object is routed like a later argument:
 
 ```ts wrong
-logger.error('charge failed', err) // the error is dropped from the line
-logger.info('charged', { orderId }) // the object is dropped from the line
+logger.info('loaded order %s', order) // message stays 'loaded order %s', order's keys spill onto the line; use logger.info({ order }, 'loaded order')
 ```
 
-`traceId`, `spanId` and `parentSpanId` are added to every line in a Logging Context, and any value you pass for those keys is replaced. To read them, call `getTraceContext()`.
+`traceId`, `spanId` and `parentSpanId` are added to every line in a Logging Context. A log call's objects can't set them, or the other moved keys (`time`, `level`, `message`, `service`, `environment`, `version`, `errors`, `args`): an object's values for those keys land in `args` instead. Logger bindings (`createLogger`, `.child()`) and Context Fields can't set `time`, `level`, `message`, `errors` or `args` either; their values for those keys land in `args` too. An object's `err`, and a string `message` when the call has no other message, are used while still unset. To read the trace IDs, call `getTraceContext()`.
 
 ## Wrangler setup
 

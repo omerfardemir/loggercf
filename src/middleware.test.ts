@@ -737,6 +737,57 @@ describe('useLogger cfRay', () => {
   })
 })
 
+class DbError extends Error {
+  code = 'E_DB'
+}
+
+/** Strip what differs between runs: time, the new span ID, duration, stacks, a generated request ID. */
+const normalizeRequestLine = (line: string) =>
+  line
+    .replace(/"time":"[^"]+"/g, '"time":"<t>"')
+    .replace(/"spanId":"[0-9a-f]+"/g, '"spanId":"<span>"')
+    .replace(/"duration":\d+/g, '"duration":0')
+    .replace(/"stack":"(?:\\.|[^"\\])*"/g, '"stack":"<stack>"')
+    .replace(/"requestId":"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"/g, '"requestId":"<uuid>"')
+
+/**
+ * The request lines written for the scenario below by the pino-based logger
+ * (main at 7c22732 with #27's request lines, pino 10), captured by running the same
+ * requests against that build. Key order included: the internal core must match.
+ */
+const BASELINE_REQUEST_LINES = [
+  String.raw`{"time":"<t>","level":"INFO","requestId":"req-1","cfRay":"8f1c2d3e4a5b6c7d-AMS","service":"gold","environment":"test","version":"1.0.0","method":"GET","path":"/ok","route":"/ok","message":"request.start GET /ok","traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"<span>","parentSpanId":"b7ad6b7169203331"}`,
+  String.raw`{"time":"<t>","level":"INFO","requestId":"req-1","cfRay":"8f1c2d3e4a5b6c7d-AMS","service":"gold","environment":"test","version":"1.0.0","method":"GET","path":"/ok","route":"/ok","statusCode":200,"duration":0,"message":"request.end GET /ok","traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"<span>","parentSpanId":"b7ad6b7169203331"}`,
+  String.raw`{"time":"<t>","level":"INFO","requestId":"<uuid>","requestIdRejected":true,"service":"gold","environment":"test","version":"1.0.0","method":"POST","path":"/boom","route":"/boom","message":"request.start POST /boom","traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"<span>","parentSpanId":"b7ad6b7169203331"}`,
+  String.raw`{"time":"<t>","level":"ERROR","requestId":"<uuid>","requestIdRejected":true,"service":"gold","environment":"test","version":"1.0.0","method":"POST","path":"/boom","route":"/boom","statusCode":500,"duration":0,"err":{"type":"DbError","message":"kaboom","stack":"<stack>","code":"E_DB","cause":{"type":"Error","message":"socket closed","stack":"<stack>"}},"message":"request.end POST /boom","traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"<span>","parentSpanId":"b7ad6b7169203331"}`,
+]
+
+describe('useLogger lines are the same as with the pino-based logger', () => {
+  beforeEach(() => _reset())
+
+  it('writes byte-identical request.start and request.end lines, including a failed request', async () => {
+    const lines = _captureLines()
+    const app = new Hono()
+    const logger = createLogger({ service: 'gold', environment: 'test', version: '1.0.0' })
+    app.use(useLogger(logger, { requestId: { from: ['x-request-id'] } }))
+    app.get('/ok', (c) => c.text('ok'))
+    app.post('/boom', () => {
+      throw new DbError('kaboom', { cause: new Error('socket closed') })
+    })
+    const traceparent = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
+
+    await app.request('/ok?x=1', {
+      headers: { traceparent, 'X-Request-Id': 'req-1', 'cf-ray': '8f1c2d3e4a5b6c7d-AMS' },
+    })
+    await app.request('/boom', {
+      method: 'POST',
+      headers: { traceparent, 'X-Request-Id': 'bad id!' },
+    })
+
+    expect(lines.map(normalizeRequestLine)).toEqual(BASELINE_REQUEST_LINES)
+  })
+})
+
 function optionsApp(options?: UseLoggerOptions) {
   const lines = _captureLines()
   const app = new Hono()
@@ -1695,14 +1746,17 @@ describe('useLogger diagnostics that cannot be written', () => {
     expect(seen[1] === thrown).toBe(true)
   })
 
-  it('keeps the response and its headers when request.start and request.end cannot be written', async () => {
+  it('keeps the response, its headers and the request lines when a Context Field cannot be written', async () => {
     const { lines, app } = optionsApp({ fields: () => ({ broken: unwritable() as never }) })
     app.get('/', (c) => c.text('handled'))
     const res = await app.request('/')
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('handled')
     expect(res.headers.get('X-Request-Id')).toMatch(UUID_RE)
-    expect(lines).toEqual([])
+    // The core replaces only the value it cannot write, so neither request line is lost.
+    const written = lines.map((line) => JSON.parse(line) as Record<string, unknown>)
+    expect(written.map((e) => e.message)).toEqual(['request.start GET /', 'request.end GET /'])
+    for (const e of written) expect(e.broken).toMatch(/^\[Unserializable: /)
   })
 
   it('keeps the response and its headers when only request.end cannot be written', async () => {
