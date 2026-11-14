@@ -70,11 +70,11 @@ The `serializeError` Logger Option, `(err, defaultSerialize) => object`: writes 
 _Avoid_: error formatter, redaction
 
 **Line Limits**:
-The `limits` Logger Option, off by default. `maxStringLength` cuts a longer string value, wherever it is, to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a line larger than that many UTF-8 bytes to fit, largest values first, keeping the Protected Fields. Whatever they cut or trim is marked in the line.
+The `limits` Logger Option, off by default. `maxStringLength` cuts a longer string value, wherever it is, to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a line larger than that many UTF-8 bytes to fit, largest values first, keeping the Protected Fields. A value of 128 bytes or less is not trimmed on its own, and neither are larger ones when trimming every one of them still wouldn't make the line fit: the array or object loses its tail instead (`"[Trimmed: <n> items, <bytes> bytes]"`, or a `"[Trimmed]"` key holding `"[Trimmed: <n> keys, <bytes> bytes]"`), so the leading values stay whole. Whatever they cut or trim is marked in the line.
 _Avoid_: truncation (only one of the two), size cap
 
 **Protected Fields**:
-What `maxRecordBytes` keeps whole while anything else on a line can go: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. Only when they alone don't fit are `message` and `err.message` cut too. `maxStringLength` never cuts them, except `message` and `err.message`.
+The fields `maxRecordBytes` trims last, after every other value: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. When they alone don't fit, `message` and `err.message` are trimmed too. As a last resort the line is `time`, `level`, the trace IDs and `logError`, with `service`, `environment`, `version`, `message` and `err.type` each trimmed to its share of the room left (left out only if even the trimmed one doesn't fit); if `time`, `level` and the trace IDs are over the limit themselves, the trace IDs go, and then `time` and `level` are trimmed. `maxStringLength` never cuts them, except `message` and `err.message`.
 _Avoid_: Record Keys, Moved Keys, Owned Keys (each is another rule)
 
 **Entrypoint Hook**:
