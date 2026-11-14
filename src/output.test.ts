@@ -12,7 +12,7 @@ import {
   _setSink,
   _reset,
 } from './logger'
-import { nodeSink, workersSink, serializeError, stringifyRecord, type Sink } from './output'
+import { nodeSink, workersSink, defaultErrorShape, stringifyRecord, type Sink } from './output'
 import { messageAfterLevel } from './test-helpers'
 
 const TRACEPARENT = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
@@ -234,7 +234,7 @@ describe('errors', () => {
     let err = new Error('e0')
     for (let i = 1; i < 10; i++) err = new Error(`e${i}`, { cause: err })
 
-    const serialized = serializeError(err)
+    const serialized = defaultErrorShape(err)
     let depth = 0
     let node = serialized
     while (node.cause && typeof node.cause === 'object') {
@@ -250,17 +250,17 @@ describe('errors', () => {
     const b = new Error('b', { cause: a })
     a.cause = b
 
-    expect(serializeError(a)).toMatchObject({
+    expect(defaultErrorShape(a)).toMatchObject({
       message: 'a',
       cause: { message: 'b', cause: '[Circular]' },
     })
-    expect(stringifyRecord(serializeError(a)).length).toBeGreaterThan(0)
+    expect(stringifyRecord(defaultErrorShape(a)).length).toBeGreaterThan(0)
   })
 
   it('a shared, non-circular Error is serialized in each place', () => {
     const shared = new Error('shared')
     const err = Object.assign(new Error('outer'), { first: shared, second: shared })
-    expect(serializeError(err)).toMatchObject({
+    expect(defaultErrorShape(err)).toMatchObject({
       first: { message: 'shared' },
       second: { message: 'shared' },
     })

@@ -286,3 +286,71 @@ describe('loggerOptionsFromEnv', () => {
     })
   })
 })
+
+describe('loggerOptionsFromEnv: limits from LOG_MAX_STRING_LENGTH and LOG_MAX_RECORD_BYTES', () => {
+  beforeEach(() => _reset())
+
+  it('reads them as limits.maxStringLength and limits.maxRecordBytes', () => {
+    expect(
+      loggerOptionsFromEnv({ LOG_MAX_STRING_LENGTH: '8192', LOG_MAX_RECORD_BYTES: 200_000 }).limits,
+    ).toStrictEqual({ maxStringLength: 8192, maxRecordBytes: 200_000 })
+    expect(loggerOptionsFromEnv({ LOG_MAX_RECORD_BYTES: '4096' }).limits).toStrictEqual({
+      maxRecordBytes: 4096,
+    })
+  })
+
+  it('leaves limits out when neither is set, so the options are as before', () => {
+    expect(loggerOptionsFromEnv({ NAME: 'api' })).toStrictEqual({ service: 'api', level: 'info' })
+  })
+
+  it('reads mapped vars, or derives them', () => {
+    expect(
+      loggerOptionsFromEnv(
+        { CHARS: '100', PROD: true },
+        { maxStringLength: 'CHARS', maxRecordBytes: (e) => (e.PROD ? '100000' : undefined) },
+      ).limits,
+    ).toStrictEqual({ maxStringLength: 100, maxRecordBytes: 100_000 })
+  })
+
+  it.each([['0'], ['1.5'], ['abc'], [' '], [-3]])(
+    'leaves out an invalid LOG_MAX_STRING_LENGTH (%s) and warns once per isolate',
+    (value) => {
+      const entries = _captureEntries()
+      const env = { LOG_MAX_STRING_LENGTH: value }
+      expect(loggerOptionsFromEnv(env).limits).toBeUndefined()
+      loggerOptionsFromEnv(env)
+      expect(entries).toEqual([
+        expect.objectContaining({
+          level: 'WARN',
+          message: `LOG_MAX_STRING_LENGTH "${value}" is not an integer >= 1; strings are not cut`,
+          invalidMaxStringLength: String(value),
+        }),
+      ])
+    },
+  )
+
+  it.each([['1023'], ['2048.5'], ['big']])(
+    'leaves out an invalid LOG_MAX_RECORD_BYTES (%s) and warns once per isolate',
+    (value) => {
+      const entries = _captureEntries()
+      const env = { LOG_MAX_RECORD_BYTES: value }
+      expect(loggerOptionsFromEnv(env).limits).toBeUndefined()
+      loggerOptionsFromEnv(env)
+      expect(entries).toEqual([
+        expect.objectContaining({
+          level: 'WARN',
+          message: `LOG_MAX_RECORD_BYTES "${value}" is not an integer >= 1024; lines are not trimmed`,
+          invalidMaxRecordBytes: value,
+        }),
+      ])
+    },
+  )
+
+  it('the options it gives build a logger that applies the limits', () => {
+    const entries = _captureEntries()
+    createLogger(loggerOptionsFromEnv({ NAME: 'api', LOG_MAX_STRING_LENGTH: '4' })).info({
+      s: 'abcdefgh',
+    })
+    expect(entries[0].s).toBe('abcd…[truncated from 8 chars]')
+  })
+})

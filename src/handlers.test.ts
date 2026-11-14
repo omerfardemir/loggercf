@@ -33,6 +33,7 @@ vi.mock('cloudflare:workers', () => ({
 
 import { WorkerEntrypoint, WorkflowEntrypoint, type WorkflowStep } from 'cloudflare:workers'
 import { withQueueMessage, withScheduled, withWorkflow, tracedStep } from './workers'
+import { omitErrorKeys } from './omit'
 import {
   _captureEntries,
   _getDefaultLogger,
@@ -849,5 +850,77 @@ describe('withWorkflow and tracedStep', () => {
       fakeStep() as any,
     )
     expect(linesOf(entries, 'mapped')[0]).toMatchObject({ service: 'reports' })
+  })
+})
+
+/** An Error with a key the application leaves out. */
+const errorWithBody = () => Object.assign(new Error('failed'), { body: 'secret' })
+
+describe('serializeError and limits in the handler helpers', () => {
+  const serializeError = omitErrorKeys(['body'])
+
+  it('withScheduled: serializeError from the options, limits from env', async () => {
+    const entries = _captureEntries()
+    const handler = withScheduled(
+      () => {
+        getLogger().info({ text: 'x'.repeat(50) }, 'tick')
+        throw errorWithBody()
+      },
+      { serializeError },
+    )
+    await expect(
+      Promise.resolve().then(() =>
+        handler(controller(), { ...ENV, LOG_MAX_STRING_LENGTH: '20' }, {} as ExecutionContext),
+      ),
+    ).rejects.toThrow('failed')
+    expect(linesOf(entries, 'tick')[0]!.text).toBe(`${'x'.repeat(20)}…[truncated from 50 chars]`)
+    expect(linesOf(entries, 'span.end scheduled')[0]!.err).toMatchObject({ omitted: ['body'] })
+    expect(JSON.stringify(entries)).not.toContain('secret')
+  })
+
+  it('withQueueMessage: serializeError from the options', async () => {
+    const entries = _captureEntries()
+    Object.assign(workersEnv, ENV)
+    const message = queueMessage({})
+    await expect(
+      withQueueMessage(
+        batch(message),
+        message,
+        async () => {
+          throw errorWithBody()
+        },
+        { serializeError },
+      ),
+    ).rejects.toThrow('failed')
+    expect(linesOf(entries, 'span.end queue.message')[0]!.err).toMatchObject({
+      omitted: ['body'],
+    })
+  })
+
+  it('withWorkflow: serializeError from the options; the same options give back the same class', async () => {
+    const entries = _captureEntries()
+    class Flow extends WorkflowEntrypoint {
+      async run() {
+        getLogger().error(errorWithBody(), 'in run')
+      }
+    }
+    const Logged = withWorkflow(Flow, { serializeError })
+    expect(withWorkflow(Logged, { serializeError })).toBe(Logged)
+    expect(() => withWorkflow(Logged)).toThrow('already wrapped with other options')
+    await (new Logged({} as any, ENV) as unknown as { run(...args: unknown[]): Promise<void> }).run(
+      event(),
+      {} as WorkflowStep,
+    )
+    expect(linesOf(entries, 'in run')[0]!.err).toMatchObject({ omitted: ['body'] })
+  })
+
+  it('without serializeError, the same env gives the same Root Logger as before', async () => {
+    const loggers = new Set<unknown>()
+    const record = withScheduled(() => {
+      loggers.add(_getDefaultLogger())
+    })
+    await record(controller(), ENV, {} as ExecutionContext)
+    await withScheduled(() => {}, { serializeError })(controller(), ENV, {} as ExecutionContext)
+    expect(loggers.size).toBe(1)
   })
 })

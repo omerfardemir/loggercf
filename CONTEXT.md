@@ -35,10 +35,10 @@ The Root Logger (or a `.child()` of one with per-process fields only) an isolate
 _Avoid_: global logger, fallback logger
 
 **Logger Options**:
-The per-process configuration a Root Logger is built from: service name, minimum level (or `silent`, which writes nothing), environment, version, and the Span Defaults.
+The per-process configuration a Root Logger is built from: service name, minimum level (or `silent`, which writes nothing), environment, version, the Span Defaults, the Error Serializer and the Line Limits.
 
 **Env Mapping**:
-Where each Logger Options field is read from in a Worker's (or process's) env: a var name or a function of env. Unmapped fields read `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, `LOG_SPAN_LEVEL` and `LOG_SPAN_SLOW_MS`.
+Where each Logger Options field is read from in a Worker's (or process's) env: a var name or a function of env. Unmapped fields read `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`, `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES`. The Error Serializer is code, so it has no var: the Workers helpers take it as a `serializeError` option.
 _Avoid_: env config, var map
 
 **Argument Routing**:
@@ -64,6 +64,18 @@ _Avoid_: extras, rest, leftovers
 **Re-write Budget**:
 What one log line may write again of what it already holds: 10,000 values, or 65,536 characters of keys and strings, inside repeats (an object written before on the line, the same `Error` again, nested as deep, an object whose `toJSON` was already called, a string of 1,024 characters or more the line already holds, or the text of a `BigInt`, a function or a symbol that long). The message and the rest of the line spend from the same one. A repeat that doesn't fit is `"[Repeated]"` as a whole, so a line holds its first copies plus about one budget, however shared its values are. Serializing an `Error` again, in a graph of Errors with cycles, has a budget of its own of the same size.
 _Avoid_: quota, limit, the line's budget
+
+**Error Serializer**:
+The `serializeError` Logger Option, `(err, defaultSerialize) => object`: writes every `Error` on a Root Logger's lines, at any depth, in place of the default shape. Called once per `Error` and line. What it returns is serialized like any value: an `Error` inside it goes through it again, a loop is `"[Circular]"`, and the Re-write Budget and the Line Limits apply. `defaultSerialize` gives the default shape with the values nested in it kept as they are. It is user code: when it throws, or returns anything but an object (a Promise included), that `Error` is written in the default shape with `serializeErrorFailed`. A line logged while it runs writes each `Error` as only `type`, `message` and `serializeErrorFailed`. The Workers helpers cache their Root Logger by its identity, so it is defined once, at module scope. `omitErrorKeys(keys)` builds one that leaves the given own keys out (never `type`) and lists them as `omitted`, the same function for the same keys; loggercf has no list of its own.
+_Avoid_: error formatter, redaction
+
+**Line Limits**:
+The `limits` Logger Option, off by default. `maxStringLength` cuts a longer string value, wherever it is, to that many characters plus `…[truncated from <n> chars]`. `maxRecordBytes` trims a line larger than that many UTF-8 bytes to fit, largest values first, keeping the Protected Fields. Whatever they cut or trim is marked in the line.
+_Avoid_: truncation (only one of the two), size cap
+
+**Protected Fields**:
+What `maxRecordBytes` keeps whole while anything else on a line can go: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. Only when they alone don't fit are `message` and `err.message` cut too. `maxStringLength` never cuts them, except `message` and `err.message`.
+_Avoid_: Record Keys, Moved Keys, Owned Keys (each is another rule)
 
 **Entrypoint Hook**:
 One of the three getters a `TracedEntrypoint` subclass overrides to supply its Env Mapping, Logger Options or Root Logger, keyed by the symbols `TracedEntrypoint.envMapping`, `.loggerOptions` and `.rootLogger`. Symbol-keyed so they stay off the entrypoint's RPC surface: a caller holding its Service Binding reaches only the string-keyed methods and getters the subclass declares.

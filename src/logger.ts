@@ -12,6 +12,7 @@ import type {
   SpanContext,
   SpanDefaults,
   SpanOptions,
+  LineLimits,
 } from './types'
 import { resolveTrace, generateSpanId, toCarrier } from './trace'
 import {
@@ -26,10 +27,13 @@ import {
   stringifyRecord,
   takeRecordKeys,
   unserializable,
+  withLineOptions,
   workersSink,
+  type LineOptions,
   type LogRecord,
   type Sink,
 } from './output'
+import { isMaxRecordBytes, isMaxStringLength } from './limits'
 import { _resetEnvWarnings } from './env'
 import { routeArgs } from './route'
 
@@ -117,6 +121,33 @@ function checkSpanDefaults(spans: SpanDefaults | undefined): SpanDefaults {
 }
 
 /**
+ * Validate the `serializeError` and `limits` Logger Options, as `createLogger` validates `level`.
+ *
+ * @param {LoggerOptions['serializeError']} serializeError - The option.
+ * @param {LineLimits | undefined} limits - The option.
+ * @returns {LineOptions | undefined} The options that are set, or `undefined` when none is.
+ * @throws {TypeError} When `serializeError` is not a function.
+ * @throws {Error} `invalid limits.maxStringLength <value>`, or `invalid limits.maxRecordBytes <value>`.
+ */
+function checkLineOptions(
+  serializeError: LoggerOptions['serializeError'],
+  limits: LineLimits | undefined,
+): LineOptions | undefined {
+  if (serializeError !== undefined && typeof serializeError !== 'function')
+    throw new TypeError('serializeError must be a function')
+  const { maxStringLength, maxRecordBytes } = limits ?? {}
+  if (maxStringLength !== undefined && !isMaxStringLength(maxStringLength))
+    throw new Error(`invalid limits.maxStringLength ${maxStringLength}`)
+  if (maxRecordBytes !== undefined && !isMaxRecordBytes(maxRecordBytes))
+    throw new Error(`invalid limits.maxRecordBytes ${maxRecordBytes}`)
+  const options: LineOptions = {}
+  if (serializeError) options.serializeError = serializeError
+  if (maxStringLength !== undefined) options.maxStringLength = maxStringLength
+  if (maxRecordBytes !== undefined) options.maxRecordBytes = maxRecordBytes
+  return Object.keys(options).length > 0 ? options : undefined
+}
+
+/**
  * Build one log line: route the arguments, add time, level and bindings, then
  * hand it to `buildRecord()` and the current sink.
  *
@@ -126,8 +157,14 @@ function checkSpanDefaults(spans: SpanDefaults | undefined): SpanDefaults {
  * @param {string} label - The upper-case level written as `level`.
  * @param {LogRecord} bindings - The logger's bindings (`createLogger` / `.child()`).
  * @param {unknown[]} input - The arguments the log method received.
+ * @param {LineOptions} [options] - The logger's `serializeError` and `limits`, if any.
  */
-function write(label: string, bindings: LogRecord, input: unknown[]): void {
+function write(
+  label: string,
+  bindings: LogRecord,
+  input: unknown[],
+  options: LineOptions | undefined,
+): void {
   const budget = newBudget() // one per line: the message's placeholders, then the record
   const entry = {
     time: new Date().toISOString(),
@@ -136,7 +173,7 @@ function write(label: string, bindings: LogRecord, input: unknown[]): void {
     budget,
     ...routeArgs(input, budget),
   }
-  sink.write(buildRecord(entry, als.getStore()))
+  sink.write(buildRecord(entry, als.getStore(), options))
 }
 
 /**
@@ -152,10 +189,16 @@ function write(label: string, bindings: LogRecord, input: unknown[]): void {
  * @param {string} label - The upper-case level written as `level`.
  * @param {LogRecord} bindings - The logger's bindings (`createLogger` / `.child()`).
  * @param {unknown[]} input - The arguments the log method received.
+ * @param {LineOptions} [options] - The logger's `serializeError` and `limits`, if any.
  */
-function safeWrite(label: string, bindings: LogRecord, input: unknown[]): void {
+function safeWrite(
+  label: string,
+  bindings: LogRecord,
+  input: unknown[],
+  options: LineOptions | undefined,
+): void {
   try {
-    write(label, bindings, input)
+    write(label, bindings, input, options)
   } catch (thrown) {
     const template = [input[0], input[1]].find((value) => typeof value === 'string')
     const trace = als.getStore()?.trace
@@ -172,7 +215,7 @@ function safeWrite(label: string, bindings: LogRecord, input: unknown[]): void {
     const minimal = (extra?: LogRecord): LogRecord => {
       const line: LogRecord = { ...head, ...extra, ...tail }
       if (trace) applyTrace(line, trace)
-      return line
+      return withLineOptions(line, options) // `limits` still apply
     }
     try {
       // Like `buildRecord()`: bindings cannot set `time`, `level` or `message`.
@@ -198,16 +241,18 @@ function safeWrite(label: string, bindings: LogRecord, input: unknown[]): void {
  * @param {number} minimum - The minimum severity written.
  * @param {LogRecord} bindings - Fixed fields on every line.
  * @param {SpanDefaults} spans - The Span Defaults, shared with every `.child()`.
+ * @param {LineOptions} [options] - `serializeError` and `limits`, shared with every `.child()`.
  * @returns {Logger<T>} The Logger.
  */
 function makeLogger<T extends LogFields = LogFields>(
   minimum: number,
   bindings: LogRecord,
   spans: SpanDefaults,
+  options?: LineOptions,
 ): Logger<T> {
   const logger = {
     child: (more: Record<string, unknown>) =>
-      makeLogger<T>(minimum, { ...bindings, ...copyBindings(more) }, spans),
+      makeLogger<T>(minimum, { ...bindings, ...copyBindings(more) }, spans, options),
   } as Logger<T>
   spanDefaults.set(logger, spans)
   for (const level of LEVELS) {
@@ -215,7 +260,7 @@ function makeLogger<T extends LogFields = LogFields>(
     logger[level] =
       LEVEL_VALUES[level] < minimum
         ? noop
-        : (...args: unknown[]) => safeWrite(label, bindings, args)
+        : (...args: unknown[]) => safeWrite(label, bindings, args, options)
   }
   return logger
 }
@@ -232,11 +277,18 @@ function makeLogger<T extends LogFields = LogFields>(
  * `slowMs`, at or above which an OK Span writes at `WARN`. Each Span's own options
  * override them.
  *
+ * `serializeError` writes every `Error` on its lines, at any depth (see
+ * `omitErrorKeys()`), and `limits` bounds each line: `maxStringLength` cuts
+ * long strings, and `maxRecordBytes` trims a large line to fit. Both are off
+ * by default, and every `.child()` keeps them.
+ *
  * @template T - The type of user-defined log fields.
  * @param {LoggerOptions} options - Logger Options. `level` defaults to `'info'`.
  * @param {Partial<T>} [bindings] - Extra per-process fields included on every log line.
  * @returns {Logger<T>} The Root Logger.
- * @throws {Error} For an unknown `level` or `spans.level`, or a `spans.slowMs` that is not a number `>= 0`.
+ * @throws {Error} For an unknown `level` or `spans.level`, a `spans.slowMs` that is not a number `>= 0`,
+ *   a `serializeError` that is not a function, a `limits.maxStringLength` that is not an integer `>= 1`,
+ *   or a `limits.maxRecordBytes` that is not an integer `>= 1024`.
  *
  * @example
  * ```ts
@@ -250,7 +302,7 @@ export function createLogger<T extends LogFields = LogFields>(
   options: LoggerOptions,
   bindings?: Partial<T>,
 ): Logger<T> {
-  const { service, level, environment, version, spans } = options
+  const { service, level, environment, version, spans, serializeError, limits } = options
   return makeLogger<T>(
     levelValue(level ?? 'info'),
     {
@@ -260,6 +312,7 @@ export function createLogger<T extends LogFields = LogFields>(
       ...copyBindings(bindings),
     },
     checkSpanDefaults(spans),
+    checkLineOptions(serializeError, limits),
   )
 }
 

@@ -1,5 +1,6 @@
 import { createLogger } from './logger'
-import type { LoggerOptions, LogLevel, SpanDefaults } from './types'
+import { isMaxRecordBytes, isMaxStringLength, MIN_RECORD_BYTES } from './limits'
+import type { LineLimits, LoggerOptions, LogLevel, SpanDefaults } from './types'
 
 type LoggerLevel = NonNullable<LoggerOptions['level']>
 
@@ -18,7 +19,7 @@ export type EnvSource<E = unknown> = string | ((env: E) => string | undefined)
 /**
  * Per-field override of the env vars `loggerOptionsFromEnv()` reads. Fields you
  * leave out keep their default var: `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`,
- * `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`.
+ * `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`, `LOG_MAX_STRING_LENGTH`, `LOG_MAX_RECORD_BYTES`.
  *
  * @template E - The worker or process environment type.
  *
@@ -53,6 +54,16 @@ export interface EnvMapping<E = unknown> {
    * `'LOG_SPAN_SLOW_MS'`; omitted when absent or not a number `>= 0`.
    */
   spanSlowMs?: EnvSource<E>
+  /**
+   * Source of `limits.maxStringLength`. Default `'LOG_MAX_STRING_LENGTH'`; omitted
+   * when absent or not an integer `>= 1` (strings are then never cut).
+   */
+  maxStringLength?: EnvSource<E>
+  /**
+   * Source of `limits.maxRecordBytes`. Default `'LOG_MAX_RECORD_BYTES'`; omitted
+   * when absent or not an integer `>= 1024` (lines are then never trimmed).
+   */
+  maxRecordBytes?: EnvSource<E>
 }
 
 const DEFAULT_VARS = {
@@ -62,6 +73,8 @@ const DEFAULT_VARS = {
   version: 'VERSION',
   spanLevel: 'LOG_SPAN_LEVEL',
   spanSlowMs: 'LOG_SPAN_SLOW_MS',
+  maxStringLength: 'LOG_MAX_STRING_LENGTH',
+  maxRecordBytes: 'LOG_MAX_RECORD_BYTES',
 } as const
 
 /** The levels `LOG_LEVEL` accepts, lowercase only. `'silent'` writes nothing, as in 0.0.1. */
@@ -79,7 +92,7 @@ const LOG_LEVELS: readonly LoggerLevel[] = [
 const SPAN_LEVELS = LOG_LEVELS.filter((level): level is LogLevel => level !== 'silent')
 
 /** A field whose invalid value writes a warning. */
-type CheckedField = 'level' | 'spanLevel' | 'spanSlowMs'
+type CheckedField = 'level' | 'spanLevel' | 'spanSlowMs' | 'maxStringLength' | 'maxRecordBytes'
 
 /** The fields whose invalid-value warning has been written in this isolate. */
 const warnedInvalid = new Set<CheckedField>()
@@ -199,16 +212,73 @@ function resolveSpans(
 }
 
 /**
+ * A whole number read from env, or `NaN`.
+ *
+ * @param {string | undefined} value - The value read from env.
+ * @returns {number} The number; `NaN` when absent or blank.
+ */
+function numberFrom(value: string | undefined): number {
+  // An empty var is already absent; a blank one would be `Number(' ') === 0`.
+  return value !== undefined && value.trim() !== '' ? Number(value) : NaN
+}
+
+/**
+ * The `limits` read from env. An invalid value is left out, and writes one WARN
+ * per field per isolate.
+ *
+ * @param {(key: 'maxStringLength' | 'maxRecordBytes') => string | undefined} field - Reads one field.
+ * @param {(key: 'maxStringLength' | 'maxRecordBytes') => string} name - The var a field is read from.
+ * @param {LoggerOptions} options - The other Logger Options, for the warnings.
+ * @returns {LineLimits | undefined} The limits, or `undefined` when none is set.
+ */
+function resolveLimits(
+  field: (key: 'maxStringLength' | 'maxRecordBytes') => string | undefined,
+  name: (key: 'maxStringLength' | 'maxRecordBytes') => string,
+  options: LoggerOptions,
+): LineLimits | undefined {
+  const limits: LineLimits = {}
+  const maxString = field('maxStringLength')
+  const chars = numberFrom(maxString)
+  if (isMaxStringLength(chars)) {
+    limits.maxStringLength = chars
+  } else if (maxString !== undefined) {
+    warnInvalid(
+      'maxStringLength',
+      options,
+      { invalidMaxStringLength: maxString },
+      `${name('maxStringLength')} "${maxString}" is not an integer >= 1; strings are not cut`,
+    )
+  }
+  const maxRecord = field('maxRecordBytes')
+  const bytes = numberFrom(maxRecord)
+  if (isMaxRecordBytes(bytes)) {
+    limits.maxRecordBytes = bytes
+  } else if (maxRecord !== undefined) {
+    warnInvalid(
+      'maxRecordBytes',
+      options,
+      { invalidMaxRecordBytes: maxRecord },
+      `${name('maxRecordBytes')} "${maxRecord}" is not an integer >= ${MIN_RECORD_BYTES}; lines are not trimmed`,
+    )
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined
+}
+
+/**
  * Build Logger Options from env.
  *
- * By default it reads `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, and the Span
+ * By default it reads `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, the Span
  * Defaults `LOG_SPAN_LEVEL` and `LOG_SPAN_SLOW_MS` (as `spans.level` and
- * `spans.slowMs`). Pass a mapping to read other var names or derive a field with a
- * function. `service` falls back to `'unknown'` and `level` to `'info'`; an absent
- * `environment`, `version` or Span Default is left out, so log lines omit it (and
- * `spans` is left out when both are). `level` accepts `'silent'`, which writes
- * nothing. An invalid level falls back to `'info'`, and an invalid Span Default is
- * left out; each writes one WARN per isolate.
+ * `spans.slowMs`), and the `limits` `LOG_MAX_STRING_LENGTH` and
+ * `LOG_MAX_RECORD_BYTES` (as `limits.maxStringLength` and
+ * `limits.maxRecordBytes`). Pass a mapping to read other var names or derive a
+ * field with a function. `service` falls back to `'unknown'` and `level` to
+ * `'info'`; an absent `environment`, `version`, Span Default or limit is left out,
+ * so log lines omit it (and `spans` or `limits` is left out when both of its
+ * fields are). `level` accepts `'silent'`, which writes nothing. An invalid level
+ * falls back to `'info'`, and an invalid Span Default or limit is left out; each
+ * writes one WARN per isolate. `serializeError` is code, so it never comes from
+ * env: add it to the result.
  *
  * @template E - The worker or process environment type.
  * @param {E} env - The worker or process environment object.
@@ -238,8 +308,10 @@ export function loggerOptionsFromEnv<E = unknown>(
     ...(version ? { version } : {}),
   }
   const level = resolveLevel(field('level'), sourceName(source('level'), 'level'), options)
-  const spans = resolveSpans(field, (key) => sourceName(source(key), key), options)
-  return { ...options, level, ...(spans ? { spans } : {}) }
+  const name = (key: keyof EnvMapping) => sourceName(source(key), key)
+  const spans = resolveSpans(field, name, options)
+  const limits = resolveLimits(field, name, options)
+  return { ...options, level, ...(spans ? { spans } : {}), ...(limits ? { limits } : {}) }
 }
 
 /**

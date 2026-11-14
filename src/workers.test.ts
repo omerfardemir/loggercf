@@ -38,6 +38,7 @@ import { DurableObject, RpcTarget, WorkerEntrypoint } from 'cloudflare:workers'
 import type { EnvMapping, SessionInit, TracedServiceBinding } from './workers'
 import type { Logger, LoggerOptions } from './types'
 import { brokenLogger } from './test-helpers'
+import { omitErrorKeys } from './omit'
 import {
   runWithLogger,
   getTraceContext,
@@ -2404,5 +2405,109 @@ describe('Span options and Span Defaults in the Workers helpers', () => {
     new (withSpans(undefined))({} as any, {}).session({ traceparent: SPAN_SAMPLED }).defaults()
 
     expect(entries.map((e) => e.level)).toEqual(['DEBUG', 'WARN', 'INFO'])
+  })
+})
+
+/** An Error with a key the application leaves out. */
+const errorWithBody = () => Object.assign(new Error('failed'), { body: 'secret' })
+
+describe('serializeError and limits in the Workers helpers', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    _reset()
+    for (const key of Object.keys(workersEnv)) delete workersEnv[key]
+  })
+
+  const serializeError = omitErrorKeys(['body'])
+
+  class FailSession extends TracedSession {
+    fail() {
+      return this.traced(() => {
+        throw errorWithBody()
+      }, 'op.fail')
+    }
+  }
+
+  it('tracedWorker: serializeError from the options, limits from env', () => {
+    const entries = _captureEntries()
+    const Worker = tracedWorker(FailSession, { serializeError })
+    const env = { NAME: 'svc', LOG_MAX_STRING_LENGTH: '4' }
+    expect(() => new Worker(undefined, env).session({ traceparent: SPAN_SAMPLED }).fail()).toThrow(
+      'failed',
+    )
+    expect(entries[0]!.err).toMatchObject({
+      message: 'fail…[truncated from 6 chars]',
+      omitted: ['body'],
+    })
+  })
+
+  it('withLogging: serializeError from the options; it is part of "the same options"', () => {
+    const entries = _captureEntries()
+    class Worker extends WorkerEntrypoint {
+      fail() {
+        throw errorWithBody()
+      }
+    }
+    const Logged = withLogging(Worker, { serializeError })
+    expect(withLogging(Logged, { serializeError })).toBe(Logged)
+    expect(() => withLogging(Logged)).toThrow('already wrapped with other options')
+    expect(() => new Logged({} as any, { NAME: 'svc' }).fail()).toThrow('failed')
+    expect(entries[0]!.err).toMatchObject({ omitted: ['body'] })
+    expect(JSON.stringify(entries)).not.toContain('secret')
+  })
+
+  it('withLogging(TracedEntrypoint) with serializeError throws: use its Logger Options hook', () => {
+    class Entry extends TracedEntrypoint {}
+    expect(() => withLogging(Entry, { serializeError })).toThrow(
+      '[TracedEntrypoint.loggerOptions] getter instead of passing serializeError',
+    )
+  })
+
+  it('TracedEntrypoint: the Logger Options hook sets serializeError and limits', () => {
+    const entries = _captureEntries()
+    class Entry extends TracedEntrypoint {
+      protected override get [TracedEntrypoint.loggerOptions](): LoggerOptions {
+        return {
+          ...super[TracedEntrypoint.loggerOptions],
+          serializeError,
+          limits: { maxStringLength: 4 },
+        }
+      }
+      session(init: SessionInit) {
+        return new FailSession(init, this[TracedEntrypoint.rootLogger], this.env)
+      }
+    }
+    expect(() => new Entry({} as any, {}).session({ traceparent: SPAN_SAMPLED }).fail()).toThrow(
+      'failed',
+    )
+    expect(entries[0]!.err).toMatchObject({
+      message: 'fail…[truncated from 6 chars]',
+      omitted: ['body'],
+    })
+  })
+
+  it('TracedEntrypoint: an inline omitErrorKeys in the hook gives one Root Logger, not one per access', () => {
+    class Entry extends TracedEntrypoint {
+      protected override get [TracedEntrypoint.loggerOptions](): LoggerOptions {
+        return { ...super[TracedEntrypoint.loggerOptions], serializeError: omitErrorKeys(['body']) }
+      }
+    }
+    const roots = new Set<Logger>()
+    for (let i = 0; i < 100; i++) {
+      const entry = new Entry({} as any, { NAME: 'svc' }) as any
+      roots.add(entry[TracedEntrypoint.rootLogger])
+      roots.add(entry[TracedEntrypoint.rootLogger])
+    }
+    expect(roots.size).toBe(1)
+  })
+
+  it('defaultLoggerFromEnv: serializeError as its second argument; each serializer its own Root Logger', () => {
+    Object.assign(workersEnv, { NAME: 'svc', LOG_MAX_RECORD_BYTES: '1024' })
+    const entries = _captureEntries()
+    const logger = defaultLoggerFromEnv(undefined, { serializeError })
+    expect(defaultLoggerFromEnv(undefined, { serializeError })).toBe(logger)
+    expect(defaultLoggerFromEnv()).not.toBe(logger)
+    logger.error(errorWithBody(), 'm')
+    expect(entries[0]!.err).toMatchObject({ omitted: ['body'] })
   })
 })

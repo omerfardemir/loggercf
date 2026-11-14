@@ -1,7 +1,14 @@
 // Internals shared by the Workers helpers (`workers.ts`, `handlers.ts`).
 // Not an entry point: nothing here is exported from the package.
 
-import type { Logger, LoggerOptions, Span, SpanOptions, TraceCarrier } from './types'
+import type {
+  ErrorSerializer,
+  Logger,
+  LoggerOptions,
+  Span,
+  SpanOptions,
+  TraceCarrier,
+} from './types'
 import {
   createLogger,
   hasDefaultLogger,
@@ -13,7 +20,38 @@ import {
 import { loggerOptionsFromEnv, type EnvMapping } from './env'
 
 /**
- * Root Loggers keyed by their Logger Options, one per isolate.
+ * Where a Workers helper's Root Logger comes from, besides the env itself: the
+ * Env Mapping, and the Logger Options that are code, so env can't hold them.
+ * Shared by the options of every helper that builds its Root Logger from env.
+ *
+ * @template E - The worker environment type.
+ */
+export interface RootLoggerSource<E = unknown> {
+  /** Where the Root Logger's options come from in env (see `loggerOptionsFromEnv`). */
+  env?: EnvMapping<E>
+  /**
+   * The Root Logger's `serializeError` (see `LoggerOptions`): code, so it can't come
+   * from env. The same function gives the same Root Logger, so define it once, at
+   * module scope, not in the call.
+   */
+  serializeError?: ErrorSerializer
+}
+
+/**
+ * Whether two helpers' Root Logger sources are the same: the same Env Mapping
+ * (see `sameEnvMapping()`) and the same `serializeError` function.
+ *
+ * @param {RootLoggerSource<any>} a - One helper's options.
+ * @param {RootLoggerSource<any>} b - The other's.
+ * @returns {boolean} `true` when they give the same Root Logger.
+ */
+export function sameRootLoggerSource(a: RootLoggerSource<any>, b: RootLoggerSource<any>): boolean {
+  return sameEnvMapping(a.env, b.env) && a.serializeError === b.serializeError
+}
+
+/**
+ * Root Loggers without a `serializeError`, keyed by their other Logger Options
+ * (see `optionsKey()`), one per isolate.
  *
  * Safe to share across concurrent requests because a Root Logger carries only
  * per-process data; per-request data lives in each Logging Context.
@@ -21,31 +59,119 @@ import { loggerOptionsFromEnv, type EnvMapping } from './env'
 const rootLoggers = new Map<string, Logger>()
 
 /**
+ * Root Loggers with a `serializeError`, by that function, then by their other
+ * Logger Options. Weak, so the loggers built for a function nothing else holds
+ * (a closure made in a request) go when it does, instead of piling up in the
+ * isolate.
+ */
+let serializerRootLoggers = new WeakMap<ErrorSerializer, Map<string, Logger>>()
+
+/** How many `serializeError` functions have had Root Loggers built in this isolate. */
+let serializersSeen = 0
+
+/**
+ * Past this many `serializeError` functions, one WARN says a new one is made on
+ * each call. A Worker needs one per Root Logger, usually one in all.
+ */
+const MAX_SERIALIZERS = 16
+
+/**
+ * The cache key for Logger Options: every option but `serializeError`.
+ *
+ * @param {LoggerOptions} options - The Logger Options.
+ * @returns {string} The key.
+ */
+function optionsKey(options: LoggerOptions): string {
+  const { service, level, environment, version, spans, limits } = options
+  return JSON.stringify([
+    service,
+    level,
+    environment,
+    version,
+    spans?.level,
+    spans?.slowMs,
+    limits?.maxStringLength,
+    limits?.maxRecordBytes,
+  ])
+}
+
+/**
+ * The Root Loggers built with `serializeError`, made empty the first time it is
+ * seen. The first one past `MAX_SERIALIZERS` writes one WARN per isolate.
+ *
+ * @param {ErrorSerializer} serializeError - The function.
+ * @param {LoggerOptions} options - The Logger Options, for the warning.
+ * @returns {Map<string, Logger>} Its Root Loggers, by `optionsKey()`.
+ */
+function loggersFor(serializeError: ErrorSerializer, options: LoggerOptions): Map<string, Logger> {
+  let loggers = serializerRootLoggers.get(serializeError)
+  if (loggers) return loggers
+  loggers = new Map()
+  serializerRootLoggers.set(serializeError, loggers)
+  if (++serializersSeen === MAX_SERIALIZERS + 1) {
+    const { service, environment, version } = options
+    createLogger({ service, environment, version }).warn(
+      { serializeErrorFunctions: serializersSeen },
+      'serializeError is a new function each call; define it once at module scope',
+    )
+  }
+  return loggers
+}
+
+/**
  * Get the isolate's Root Logger for these Logger Options, creating it once.
+ * A `serializeError` is matched by identity: another function, even one that
+ * does the same, gets a Root Logger of its own.
  *
  * @param {LoggerOptions} options - Logger Options (usually from `loggerOptionsFromEnv`).
  * @returns {Logger} The cached Root Logger.
  */
 export function cachedRootLogger(options: LoggerOptions): Logger {
-  const { service, level, environment, version, spans } = options
-  const key = JSON.stringify([service, level, environment, version, spans?.level, spans?.slowMs])
-  let logger = rootLoggers.get(key)
+  const { serializeError } = options
+  const loggers =
+    typeof serializeError === 'function' ? loggersFor(serializeError, options) : rootLoggers
+  const key = optionsKey(options)
+  let logger = loggers.get(key)
   if (!logger) {
     logger = createLogger(options)
-    rootLoggers.set(key, logger)
+    loggers.set(key, logger)
   }
   return logger
 }
 
+/** Test only: forget every cached Root Logger and the `serializeError` count. */
+export function _resetRootLoggers(): void {
+  rootLoggers.clear()
+  serializerRootLoggers = new WeakMap()
+  serializersSeen = 0
+}
+
 /**
- * The isolate's cached Root Logger for a Worker env read through an Env Mapping.
+ * The isolate's cached Root Logger for a Worker env, read through a helper's
+ * Env Mapping, with the `serializeError` it was given in code.
  *
  * @param {unknown} env - The Worker's env.
- * @param {EnvMapping} [mapping] - The Env Mapping.
+ * @param {RootLoggerSource<any>} [source] - The helper's `env` and `serializeError` options.
  * @returns {Logger} The cached Root Logger.
  */
-export function envRootLogger(env: unknown, mapping: EnvMapping<any> | undefined): Logger {
-  return cachedRootLogger(loggerOptionsFromEnv(env, mapping))
+export function envRootLogger(env: unknown, source: RootLoggerSource<any> = {}): Logger {
+  return cachedRootLogger(
+    withSerializer(loggerOptionsFromEnv(env, source.env), source.serializeError),
+  )
+}
+
+/**
+ * Logger Options with a helper's `serializeError` added, when it has one.
+ *
+ * @param {LoggerOptions} options - The Logger Options.
+ * @param {ErrorSerializer} [serializeError] - The helper's `serializeError` option.
+ * @returns {LoggerOptions} `options`, or a copy with `serializeError`.
+ */
+export function withSerializer(
+  options: LoggerOptions,
+  serializeError: ErrorSerializer | undefined,
+): LoggerOptions {
+  return serializeError === undefined ? options : { ...options, serializeError }
 }
 
 /**

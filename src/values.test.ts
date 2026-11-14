@@ -8,7 +8,7 @@ import {
   _reset,
   _setSink,
 } from './logger'
-import { serializeError, stringifyRecord } from './output'
+import { defaultErrorShape, stringifyRecord } from './output'
 import { formatMessage } from './route'
 import type { Logger } from './types'
 
@@ -238,14 +238,14 @@ describe('errors that reference themselves', () => {
     expect(entries[0].logError).toBeUndefined()
   })
 
-  it('serializeError never throws on a getter that throws', () => {
+  it('defaultErrorShape never throws on a getter that throws', () => {
     const e = Object.defineProperty(new Error('boom'), 'code', {
       enumerable: true,
       get() {
         throw new Error('no code')
       },
     })
-    expect(serializeError(e)).toMatchObject({
+    expect(defaultErrorShape(e)).toMatchObject({
       message: 'boom',
       code: '[Unserializable: Error: no code]',
     })
@@ -724,7 +724,7 @@ describe('an Error is serialized once per line', () => {
     const y = new Error('y', { cause: z })
     z.cause = x
     const root = Object.assign(new Error('root'), { p: x, q: y })
-    expect(serializeError(root)).toMatchObject({
+    expect(defaultErrorShape(root)).toMatchObject({
       p: { message: 'x', cause: { message: 'z', cause: '[Circular]' } },
       q: { message: 'y', cause: { message: 'z', cause: { message: 'x', cause: '[Circular]' } } },
     })
@@ -782,7 +782,7 @@ describe('an Error is serialized once per line', () => {
       return kid
     })
     root.errors.push(...kids, ...kids, crossed(1, 'short'))
-    const out = serializeError(root) as { errors: unknown[] }
+    const out = defaultErrorShape(root) as { errors: unknown[] }
     expect(out.errors[3000]).toBe(out.errors[0]) // the same copy, so the walk sees a repeat
     expect(out.errors[5999]).toBe(out.errors[2999])
     // So the budget is still there for the cycle that needs a copy of its own.
@@ -791,21 +791,21 @@ describe('an Error is serialized once per line', () => {
 
   it('serializing Errors again spends one budget, summed over every copy', () => {
     // Each copy of z: 104 values (type, message, stack, k0..k99, cause) and 328 characters.
-    const out = serializeError(crossed(1001, 's', wide(100)))
+    const out = defaultErrorShape(crossed(1001, 's', wide(100)))
     expect(ownCopies(out, 1001)).toBe(Math.floor(10_000 / 104))
   })
 
   it('a copy is charged the digits of its BigInt when it is serialized again', () => {
     // Each copy of z: 5 values (type, message, stack, b, cause) and 1,040 characters.
-    const out = serializeError(crossed(500, 's', { b: 10n ** 1000n }))
+    const out = defaultErrorShape(crossed(500, 's', { b: 10n ** 1000n }))
     expect(ownCopies(out, 500)).toBe(Math.floor(65_536 / 1040))
   })
 
   it('a stack under 1,024 characters is charged when serialized again; a longer one is not', () => {
     // With 200-character stacks each copy of z costs 237 characters: 276 of 500 fit.
-    expect(ownCopies(serializeError(crossed(500, 's'.repeat(200))), 500)).toBe(276)
+    expect(ownCopies(defaultErrorShape(crossed(500, 's'.repeat(200))), 500)).toBe(276)
     // A long stack is bounded as a repeated long string instead: each copy costs 37.
-    expect(ownCopies(serializeError(crossed(500, 's'.repeat(1100))), 500)).toBe(500)
+    expect(ownCopies(defaultErrorShape(crossed(500, 's'.repeat(1100))), 500)).toBe(500)
   })
 
   it('an AggregateError writes its errors, nested like cause', () => {

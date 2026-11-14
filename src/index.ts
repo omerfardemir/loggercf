@@ -7,6 +7,8 @@ export type {
   SpanOptions,
   SpanDefaults,
   LoggerOptions,
+  ErrorSerializer,
+  LineLimits,
   Logger,
   LogLevel,
 } from './types'
@@ -21,6 +23,7 @@ export {
   getTraceContext,
   getTraceCarrier,
 } from './logger'
+export { omitErrorKeys } from './omit'
 export { tracedFetch, tracedFetcher } from './fetch'
 export type { TracedFetchOptions } from './fetch'
 export { loggerOptionsFromEnv } from './env'

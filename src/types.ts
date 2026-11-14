@@ -174,6 +174,65 @@ export interface ALSStore<T extends LogFields = LogFields> {
 }
 
 /**
+ * Writes one `Error` of a log line, in place of loggercf's default shape
+ * (`{ type, message, stack, ...own enumerable props, errors?, cause? }`).
+ * Called for every `Error` on the line, at any depth, once per `Error` and
+ * line. What it returns is written like any value: an `Error` inside it is
+ * written by this serializer too, where it loops it is `"[Circular]"`, and
+ * the Re-write Budget and `limits` apply. A throw is never passed on: that
+ * `Error` is written in the default shape, with `serializeErrorFailed`
+ * describing the failure. So is a result that is not an object, or is a
+ * Promise (`serializeError returned undefined`, `... a Promise`): it must
+ * return an object, synchronously.
+ *
+ * A line logged while it runs (its own code logs), through any logger, writes
+ * each `Error` as only `{ type, message, serializeErrorFailed: 'logged from
+ * inside serializeError' }`, so a synchronous serializer can't call itself
+ * again or write what it leaves out (an `Error` nested two or more levels deep
+ * whose class has its own `toJSON` is still written by that `toJSON`).
+ *
+ * `defaultSerialize(e)` gives `e`'s default shape, with the values inside it
+ * (`cause`, an `Error`-valued property, `errors`) kept as they are: loggercf
+ * writes them afterwards, through this serializer.
+ *
+ * @example
+ * ```ts
+ * const serializeError: ErrorSerializer = (err, defaultSerialize) =>
+ *   err instanceof HttpError ? { type: 'HttpError', message: err.message, status: err.status } : defaultSerialize(err)
+ * ```
+ */
+export type ErrorSerializer = (
+  err: Error,
+  defaultSerialize: (err: Error) => Record<string, unknown>,
+) => Record<string, unknown>
+
+/**
+ * Size limits on each log line. Off by default: without them, nothing is cut.
+ *
+ * @example
+ * ```ts
+ * const logger = createLogger({ service: 'api', limits: { maxStringLength: 8_192, maxRecordBytes: 200_000 } })
+ * ```
+ */
+export interface LineLimits {
+  /**
+   * A string value longer than this many characters keeps its first
+   * `maxStringLength` characters, followed by `…[truncated from <length> chars]`.
+   * Applies at any depth, `message` and `err.message` included; `time`, `level`,
+   * the trace IDs, `service`, `environment`, `version` and `err.type` are never cut.
+   * An integer, 1 or more.
+   */
+  maxStringLength?: number
+  /**
+   * A line larger than this many UTF-8 bytes is trimmed to fit, its largest
+   * values first. `time`, `level`, `message`, the trace IDs, `service`,
+   * `environment`, `version` and `err`'s `type` and `message` are kept whole
+   * unless they alone are too large. An integer, 1,024 or more.
+   */
+  maxRecordBytes?: number
+}
+
+/**
  * Options for creating a Logger instance.
  *
  * @example
@@ -200,6 +259,15 @@ export interface LoggerOptions {
    * override them.
    */
   spans?: SpanDefaults
+  /**
+   * Writes every `Error` on this logger's lines, at any depth, in place of the
+   * default shape. See `omitErrorKeys()` for leaving out keys that hold user data.
+   * Define it once, at module scope: the Workers helpers cache their Root Logger
+   * by this function.
+   */
+  serializeError?: ErrorSerializer
+  /** The Line Limits: size limits on each line. Off by default. */
+  limits?: LineLimits
 }
 
 /**

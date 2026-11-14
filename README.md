@@ -57,18 +57,22 @@ Cloudflare Workers must enable Node.js compatibility in `wrangler.jsonc`:
 }
 ```
 
-| Var                | Logger Option  | When absent                                           |
-| ------------------ | -------------- | ----------------------------------------------------- |
-| `NAME`             | `service`      | `'unknown'`                                           |
-| `LOG_LEVEL`        | `level`        | `'info'`                                              |
-| `ENVIRONMENT`      | `environment`  | left off every log line                               |
-| `VERSION`          | `version`      | left off every log line                               |
-| `LOG_SPAN_LEVEL`   | `spans.level`  | OK Spans write `span.end` at `'info'`                 |
-| `LOG_SPAN_SLOW_MS` | `spans.slowMs` | no Slow Threshold (see [Span Logging](#span-logging)) |
+| Var                     | Logger Option            | When absent                                                                   |
+| ----------------------- | ------------------------ | ----------------------------------------------------------------------------- |
+| `NAME`                  | `service`                | `'unknown'`                                                                   |
+| `LOG_LEVEL`             | `level`                  | `'info'`                                                                      |
+| `ENVIRONMENT`           | `environment`            | left off every log line                                                       |
+| `VERSION`               | `version`                | left off every log line                                                       |
+| `LOG_SPAN_LEVEL`        | `spans.level`            | OK Spans write `span.end` at `'info'`                                         |
+| `LOG_SPAN_SLOW_MS`      | `spans.slowMs`           | no Slow Threshold (see [Span Logging](#span-logging))                         |
+| `LOG_MAX_STRING_LENGTH` | `limits.maxStringLength` | strings are never cut (see [Errors and size limits](#errors-and-size-limits)) |
+| `LOG_MAX_RECORD_BYTES`  | `limits.maxRecordBytes`  | lines are never trimmed                                                       |
 
 `LOG_LEVEL` must be one of `trace`, `debug`, `info`, `warn`, `error`, `fatal` or `silent` (lowercase). `silent` writes nothing at all. A missing or empty value means `'info'`. Any other value falls back to `'info'` and writes one `WARN` per isolate with `invalidLevel` and `validLevels`.
 
 `LOG_SPAN_LEVEL` takes the same lowercase levels except `silent`, and `LOG_SPAN_SLOW_MS` a number of milliseconds, `0` or more. Either one, when invalid, is left out and writes one `WARN` per isolate naming the bad value. They are the [Span Defaults](#span-logging) of the Root Logger these helpers build, and the only way to set them for `withLogging`, `withScheduled`, `withQueueMessage` and `withWorkflow`, which build their Root Logger from env.
+
+`LOG_MAX_STRING_LENGTH` takes an integer, `1` or more, and `LOG_MAX_RECORD_BYTES` an integer, `1024` or more. They are the Root Logger's [`limits`](#errors-and-size-limits), off when unset; set them in production. Either one, when invalid, is left out and writes one `WARN` per isolate naming the bad value. The Root Logger's `serializeError` is code, so it never comes from env: the helpers take it as an option.
 
 Using other var names, or deriving a field from a binding, takes a mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)). To use Cloudflare's [version metadata](https://developers.cloudflare.com/workers/runtime-apis/bindings/version-metadata/) as `version`, add the binding under a name of your choice and map it with a function:
 
@@ -97,6 +101,7 @@ Changes to the Logger Options read from env:
 - `LOG_LEVEL: "SILENT"` (any level name not in lowercase) falls back to `'info'` with one `WARN`; 0.0.1 passed it on and threw. `"silent"` still mutes all logs, as in 0.0.1.
 
 - The env helpers read two new vars, `LOG_SPAN_LEVEL` and `LOG_SPAN_SLOW_MS`, as the Span Defaults (see [Span Logging](#span-logging)). An invalid value is ignored with one `WARN`.
+- They also read `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES`, as the [`limits`](#errors-and-size-limits). Unset, nothing is cut or trimmed, as in 0.0.1. A Worker that already sets a var by either name for something else now has its lines cut or trimmed: rename that var, or map the field to another one. An invalid value is ignored with one `WARN`.
 
 Changes to Spans:
 
@@ -154,7 +159,7 @@ logger.info({ userId: 'u-42' }, 'Request started')
 // → {"time":"...","level":"INFO","service":"my-worker","environment":"production","version":"1.2.3","userId":"u-42","message":"Request started"}
 ```
 
-`level` defaults to `'info'`. `service`, `environment` and `version` are on every line. `spans` sets the [Span Defaults](#span-logging) (`{ level, slowMs }`) for every Span in a Logging Context this logger opens. An unknown `level` or `spans.level`, or a `spans.slowMs` that is not a number `>= 0`, throws. An optional second argument adds more fixed fields. Keep these to per-process data: an isolate serves many requests at once, so per-request data (`requestId`, `userId`, ...) belongs in a Logging Context's fields (see `runWithLogger`).
+`level` defaults to `'info'`. `service`, `environment` and `version` are on every line. `spans` sets the [Span Defaults](#span-logging) (`{ level, slowMs }`) for every Span in a Logging Context this logger opens. `serializeError` writes every `Error` your way, and `limits` (`{ maxStringLength, maxRecordBytes }`) keeps each line under a size; both are off by default (see [Errors and size limits](#errors-and-size-limits)). An unknown `level` or `spans.level`, a `spans.slowMs` that is not a number `>= 0`, a `serializeError` that is not a function, a `limits.maxStringLength` that is not an integer `>= 1` or a `limits.maxRecordBytes` that is not an integer `>= 1024` throws. An optional second argument adds more fixed fields. Keep these to per-process data: an isolate serves many requests at once, so per-request data (`requestId`, `userId`, ...) belongs in a Logging Context's fields (see `runWithLogger`).
 
 ### `getLogger(service?)`
 
@@ -192,7 +197,7 @@ getLogger().info('starting') // service, environment and version from env
 - The logger you register or pass to `useLogger`, and a `TracedEntrypoint`'s [hook](#tracedentrypointenv) overrides, must not depend on the request or on `ctx.props`: the first one registered stays the default for the isolate.
 - A Worker that exports several entrypoints with different services should register its default explicitly at module scope (`defaultLoggerFromEnv()` or `setDefaultLogger()`). Otherwise whichever entrypoint class is constructed first in an isolate wins.
 
-`useLogger(rootLogger)`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withScheduled`, `withQueueMessage`, `withWorkflow` and `defaultLoggerFromEnv` register their Root Logger the first time they see one, unless a default is already set: first seen wins. On Workers, [`defaultLoggerFromEnv()`](#defaultloggerfromenvmapping) builds and registers one from `env` with no setup.
+`useLogger(rootLogger)`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withScheduled`, `withQueueMessage`, `withWorkflow` and `defaultLoggerFromEnv` register their Root Logger the first time they see one, unless a default is already set: first seen wins. On Workers, [`defaultLoggerFromEnv()`](#defaultloggerfromenvmapping-options) builds and registers one from `env` with no setup.
 
 ### `setLoggerContext(fields)`
 
@@ -343,9 +348,9 @@ A Span's status says whether the call completed, not what it answered. Any respo
 
 Map Worker (or `process.env`) variables into `LoggerOptions`: `NAME`, `LOG_LEVEL`, `ENVIRONMENT` and `VERSION` by default (see [Cloudflare Worker Requirements](#cloudflare-worker-requirements) for fallbacks).
 
-`LOG_SPAN_LEVEL` and `LOG_SPAN_SLOW_MS` are read too, as `spans.level` and `spans.slowMs`; `spans` is left out when neither is set.
+`LOG_SPAN_LEVEL` and `LOG_SPAN_SLOW_MS` are read too, as `spans.level` and `spans.slowMs`; `spans` is left out when neither is set. So are `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES`, as `limits.maxStringLength` and `limits.maxRecordBytes`; `limits` is left out when neither is set. `serializeError` is never read from env: add it to the result (`{ ...loggerOptionsFromEnv(env), serializeError }`).
 
-`mapping` overrides where each field comes from: `service`, `level`, `environment`, `version`, `spanLevel` or `spanSlowMs` take a var name or a function `(env) => string | undefined`. Fields you leave out keep their default var. A mapped field doesn't fall back to its default var. A number is used as its string form; an empty string or any other non-string value counts as absent.
+`mapping` overrides where each field comes from: `service`, `level`, `environment`, `version`, `spanLevel`, `spanSlowMs`, `maxStringLength` or `maxRecordBytes` take a var name or a function `(env) => string | undefined`. Fields you leave out keep their default var. A mapped field doesn't fall back to its default var. A number is used as its string form; an empty string or any other non-string value counts as absent.
 
 ```ts
 import { createLogger, loggerOptionsFromEnv } from 'loggercf'
@@ -585,7 +590,7 @@ export default tracedWorker(MySession)
 
 ### `tracedWorker(SessionClass, options?)`
 
-Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class.
+Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class. `options.serializeError` is the Root Logger's [`serializeError`](#errors-and-size-limits).
 
 ```ts
 // This is your entire worker export:
@@ -706,7 +711,7 @@ export default class extends TracedEntrypoint<Env> {
 }
 ```
 
-### `defaultLoggerFromEnv(mapping?)`
+### `defaultLoggerFromEnv(mapping?, options?)`
 
 The zero-config way to get a [Default Logger](#setdefaultloggerlogger) on Workers. It reads the Worker's `env` through `import { env } from 'cloudflare:workers'`, so it works at module scope and in code that never receives `env`. It builds the Root Logger from `loggerOptionsFromEnv(env, mapping)`, registers it as the Default Logger unless one is already set, and returns it.
 
@@ -725,7 +730,7 @@ app.use(useLogger(logger))
 getLogger().info('module scope') // service, environment and version from env
 ```
 
-The Root Logger is created once per Logger Options and is the same instance `TracedEntrypoint`, `tracedWorker` and `withLogging` use for the same env. `mapping` takes the same [Env Mapping](#loggeroptionsfromenvenv-mapping) as `loggerOptionsFromEnv`; its env type defaults to `Cloudflare.Env` (from `wrangler types`). A `setDefaultLogger` call made before it keeps its logger as the default; one made after it replaces it.
+`options.serializeError` is the Root Logger's [`serializeError`](#errors-and-size-limits) (`defaultLoggerFromEnv(undefined, { serializeError })`). The Root Logger is created once per Logger Options and is the same instance `TracedEntrypoint`, `tracedWorker` and `withLogging` use for the same env and `serializeError`. `mapping` takes the same [Env Mapping](#loggeroptionsfromenvenv-mapping) as `loggerOptionsFromEnv`; its env type defaults to `Cloudflare.Env` (from `wrangler types`). A `setDefaultLogger` call made before it keeps its logger as the default; one made after it replaces it.
 
 ### `withLogging(Class, options?)`
 
@@ -755,17 +760,18 @@ export default withLogging(SearchWorker, { spans: true })
 - `entrypoint` is the class's `name`. A build that minifies class names changes it. An anonymous class (`withLogging(class extends WorkerEntrypoint { ... })`) gets no `entrypoint` field, and its Spans are named by the method alone.
 - Only the methods the class has when it is wrapped are wrapped. Put every RPC method on the class before wrapping it. A method added or overridden in a subclass of the wrapped class (`class Ext extends withLogging(A) { extra() {} }`) runs outside every Logging Context, so extend the wrapped class only to add handlers.
 - The class must extend `WorkerEntrypoint` or `DurableObject` (see [Durable Objects](#durable-objects)). Wrapping anything else throws.
-- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env` as well throws; override `[TracedEntrypoint.envMapping]` instead.
-- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch` and `env`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
+- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env` or `serializeError` as well throws; override `[TracedEntrypoint.envMapping]` or `[TracedEntrypoint.loggerOptions]` instead.
+- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch`, `env` and `serializeError`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
 - With `session: true`, a field the caller passes named `rpcMethod` or `entrypoint` is replaced by the receiver's.
 - Only method calls are wrapped. A method named like a handler (`trace`, `test`, `email`, `connect`, `queue`, `tail` or `tailStream`) is never wrapped. These run outside the Logging Context: a getter read over RPC, and the body of an `async *` method, which runs on each `.next()`, after the call has returned. A sync method that returns an un-awaited `RpcPromise` gets a span that ends when the method returns, not when the promise settles (`spans` treats only a real `Promise` as async). Make the method `async` and `await` the call to time it.
 
-| Option    | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                               |
-| --------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `spans`   | `false` | Record each call as a [Span](#span-logging) named `<Class>.<method>`: one `span.end` with duration and status, at `ERROR` with `err` when the method throws or rejects. Its level and Slow Threshold come from the Root Logger's Span Defaults (`LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`). Without it, a throw is still logged, as one `<Class>.<method> failed` line at `ERROR`. The error is rethrown unchanged either way. |
-| `session` | `false` | Add `session(init)`, which returns a Traced Session over the same methods (see below). Throws if the class already has a `session` method or getter, own or inherited.                                                                                                                                                                                                                                                    |
-| `fetch`   | `true`  | Wrap `fetch` in its own Logging Context. Pass `false` when `fetch` hands the request to a Hono app that uses `useLogger`, which opens one itself.                                                                                                                                                                                                                                                                         |
-| `env`     | `{}`    | [Env Mapping](#loggeroptionsfromenvenv-mapping) for the Root Logger.                                                                                                                                                                                                                                                                                                                                                      |
+| Option           | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `spans`          | `false` | Record each call as a [Span](#span-logging) named `<Class>.<method>`: one `span.end` with duration and status, at `ERROR` with `err` when the method throws or rejects. Its level and Slow Threshold come from the Root Logger's Span Defaults (`LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`). Without it, a throw is still logged, as one `<Class>.<method> failed` line at `ERROR`. The error is rethrown unchanged either way. |
+| `session`        | `false` | Add `session(init)`, which returns a Traced Session over the same methods (see below). Throws if the class already has a `session` method or getter, own or inherited.                                                                                                                                                                                                                                                    |
+| `fetch`          | `true`  | Wrap `fetch` in its own Logging Context. Pass `false` when `fetch` hands the request to a Hono app that uses `useLogger`, which opens one itself.                                                                                                                                                                                                                                                                         |
+| `serializeError` | none    | The Root Logger's [`serializeError`](#errors-and-size-limits).                                                                                                                                                                                                                                                                                                                                                            |
+| `env`            | `{}`    | [Env Mapping](#loggeroptionsfromenvenv-mapping) for the Root Logger.                                                                                                                                                                                                                                                                                                                                                      |
 
 #### Durable Objects
 
@@ -840,7 +846,7 @@ export default {
 } satisfies ExportedHandler<Env>
 ```
 
-- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins).
+- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, with `options.serializeError`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins).
 - The handler gets the same arguments; its return value is returned and a throw rethrown unchanged. It never calls `controller.noRetry()`.
 - On a class entrypoint (`WorkerEntrypoint`, `TracedEntrypoint`, `tracedWorker(...)`, `withLogging(...)`), wrap the handler once at module scope and call it from the method with `this.env` and `this.ctx`:
 
@@ -889,7 +895,7 @@ export default {
 - For an unsampled trace (`traceFlags` `00`) the `span.end` timing line is skipped, but a throw is still logged: one `queue.message failed` line at `ERROR` with `err` and a `span` object without timing (`operation`, `status: 'ERROR'`, `error`). A new root trace is always sampled.
 - `await` (or return) every call. The batch is acked implicitly when `queue` returns, so with a missing `await` the handler can return, and the batch be acked, while the work is still running, and its throw is lost.
 - Running the messages concurrently is safe: `await Promise.all(batch.messages.map((m) => withQueueMessage(batch, m, () => handle(m))))`. Each call has its own Logging Context, so Context Fields and traces never mix between messages.
-- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping) reads it) with `options.env` as the Env Mapping, and registered as the Default Logger unless one is already set.
+- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping-options) reads it) with `options.env` as the Env Mapping and `options.serializeError`, and registered as the Default Logger unless one is already set.
 
 ### `withWorkflow(Class, options?)` and `tracedStep(step, name, ...)`
 
@@ -923,7 +929,7 @@ await env.REPORT.create({ params: { ...params, trace: getTraceCarrier() } })
 - When the payload has a Trace Carrier under `trace`, `run` continues it, so every replay of one instance shares the creator's `traceId`. Without one, each execution of `run` (every replay after a sleep, wait or restart) starts a new root trace, so one instance's lines span several `traceId`s: join them on `workflowInstanceId`, or pass `trace: getTraceCarrier()` to `create()`.
 - `run` itself writes no Span: it is replayed from the top after every sleep and wait, and a pause or termination surfaces in it as a throw. Lines logged in `run` outside a step repeat on each replay.
 - **A throw outside every `tracedStep` is not logged.** That covers validation before the first step, code between steps, and a plain `step.do`. The engine uses thrown errors in `run` for its own control flow (pause, terminate, restart; locally these are `Error`s whose message starts with `Aborting engine:`), and neither `@cloudflare/workers-types` nor the Workflows docs define a marker that tells them apart from your errors in production, so `withWorkflow` does not log when `run` rejects rather than log engine control as `ERROR`. Such a throw still fails the instance and shows as its error in the Workflows dashboard and `instance.status()`. Put every unit of work, validation included, in a `tracedStep`, which logs each failed attempt.
-- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env`, registered as the Default Logger in the constructor unless one is already set. Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
+- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env` and `options.serializeError`, registered as the Default Logger in the constructor unless one is already set. Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
 - Outside a Logging Context (a class not wrapped with `withWorkflow`), `tracedStep` calls `step.do` with the arguments untouched and logs nothing.
 
 ### Service Type Convention
@@ -1133,11 +1139,152 @@ Every runtime builds the same JSON line, one per log call (covered by a test tha
 
 - Starts with `time` (ISO 8601) and `level` (`TRACE` … `FATAL`), then `message` when the line has one; no `pid` or `hostname`.
 - When keys collide: loggercf always writes `time`, `level`, `message`, `errors` and `args` itself (the record keys), and the trace IDs (`traceId`, `spanId`, `parentSpanId`) inside a Logging Context. Logger bindings and Context Fields can't set them either: their values for the record keys move to `args` (after the call's own `args`, logger bindings first), so a `.child({ level: 'ERROR' })` can't change a line's severity. For every other key, strongest first: fields passed to the log call (which can't set `service`, `environment` or `version`, see above) → logger bindings (`createLogger` / `.child()`) → Context Fields.
-- Errors become `{ type, message, stack, ...own fields (e.g. code), errors, cause }`, with `cause`, an `AggregateError`'s `errors` and every own field that is an `Error` nested the same way. That holds at any depth: `err`, `errors`, a field, inside objects, arrays, `Map`s and `Set`s, in `args`, Context Fields and logger bindings. `logger.error('m', { failures: [e1], ctx: { err: e2 } })` writes `failures` and `ctx.err` with the same shape as `err`. Errors nest up to 5 levels, counted through any objects between them (`{ cause: { attempt: e } }`); a deeper one is `{ "type": "Truncated", ... }`. An `Error` that refers back to itself (`err.self = err`, a `cause` loop, a `cause` holding an object that holds the `Error`) is `"[Circular]"` where it loops: where an `Error` or object it is nested in comes again. The same `Error` reached more than once is a repeat (see below). A nested `Error` with its own `toJSON` is written by it, as JSON does. A top-level one keeps the `Error` shape when `toJSON` is a class method; an own `toJSON` property (`e.toJSON = fn`) is copied with the other own fields, so it writes that `Error` too. A fake `Error` (`Object.create(Error.prototype)`) is written as one, and an `Error` from another realm (a `vm` context) too, where the runtime has `Error.isError`.
+- Errors become `{ type, message, stack, ...own fields (e.g. code), errors, cause }` (or what your [`serializeError`](#errors-and-size-limits) writes), with `cause`, an `AggregateError`'s `errors` and every own field that is an `Error` nested the same way. That holds at any depth: `err`, `errors`, a field, inside objects, arrays, `Map`s and `Set`s, in `args`, Context Fields and logger bindings. `logger.error('m', { failures: [e1], ctx: { err: e2 } })` writes `failures` and `ctx.err` with the same shape as `err`. Errors nest up to 5 levels, counted through any objects between them (`{ cause: { attempt: e } }`); a deeper one is `{ "type": "Truncated", ... }`. An `Error` that refers back to itself (`err.self = err`, a `cause` loop, a `cause` holding an object that holds the `Error`) is `"[Circular]"` where it loops: where an `Error` or object it is nested in comes again. The same `Error` reached more than once is a repeat (see below). A nested `Error` with its own `toJSON` is written by it, as JSON does. A top-level one keeps the `Error` shape when `toJSON` is a class method; an own `toJSON` property (`e.toJSON = fn`) is copied with the other own fields, so it writes that `Error` too. A fake `Error` (`Object.create(Error.prototype)`) is written as one, and an `Error` from another realm (a `vm` context) too, where the runtime has `Error.isError`.
 - An `undefined` property is left out, as JSON leaves it out: `{ a: undefined, b: 1 }` writes only `b`, as a field and under `%j` alike. An `undefined` array item is `null`.
 - `BigInt` is written as a string, a function as `"[Function: name]"` (`"[Function: anonymous]"` without a name), a symbol as `"Symbol(description)"` (boxed or not), a `Map` as an array of `[key, value]` pairs and a `Set` as an array.
 - An object that contains itself is written as `"[Circular]"` where it loops. An object that appears more than once without a loop (`{ p: shared, q: shared }`, the same `Error` twice, an object whose `toJSON` returns a new object each time) is written in full each time, within the line's Re-write Budget: 10,000 values, or 65,536 characters of keys and strings, written again inside repeats at any depth. A string value of 1,024 characters or more that the line already holds counts its length against the same budget, and so does the text of a `BigInt`, a function or a symbol that long; shorter ones repeat freely, and so does a key of any length outside a repeated object. The line has one Re-write Budget, which the message spends from too: its `%j` / `%o` / `%O` placeholders, and the strings and `BigInt`s of 1,024 characters or more it already holds (as a word, or under `%s`, `%d` or `%i`). A long one the message can't hold again goes to `args` instead, where it is `"[Repeated]"` once the budget is spent. A repeat that doesn't fit the budget is `"[Repeated]"` as a whole (never cut part way). So a wide or deeply shared structure adds at most that budget to the line, beyond one full copy in the message and one in the rest of the line.
 - A log call never throws. A value that can't be read or serialized (a getter or a `toJSON` that throws, a `Proxy` whose traps throw) is written as `"[Unserializable: <reason>]"`, in place of that value only: the rest of the line, `err` included, is kept. Logger bindings are read once, when `.child()` or `createLogger` is called, the same way. A minimal line is the last resort, for a failure no single value explains: a value nested so deep that writing it overflows the stack, a line too long to build as a string (`Invalid string length`), or the output itself failing (the console method throws). It has `time`, `level`, the trace IDs, the logger bindings, the message template as given, and `logError` describing the failure.
+
+### Errors and size limits
+
+Two Logger Options change how a line is written. Both are off by default: without them, every `Error` is written with all its own properties and nothing is cut. Whatever they leave out, cut or trim is marked in the line, never silently gone.
+
+#### `serializeError`: write Errors your way
+
+`serializeError(err, defaultSerialize)` writes every `Error` on the logger's lines, at any depth: `err`, `errors`, a field, inside objects and arrays, `args`, Context Fields, logger bindings, `span.end` and `request.end`. It returns the object to write. `defaultSerialize(err)` gives the default shape (`{ type, message, stack, ...own fields, errors?, cause? }`) to start from.
+
+```ts
+import { createLogger } from 'loggercf'
+
+const logger = createLogger({
+  service: 'api',
+  serializeError: (err, defaultSerialize) =>
+    err instanceof HttpError
+      ? {
+          type: 'HttpError',
+          message: err.message,
+          status: err.status,
+          retryable: err.status >= 500,
+        }
+      : defaultSerialize(err),
+})
+```
+
+- It is called once per `Error` and line, however often the `Error` appears on the line.
+- What it returns is written like any other value. An `Error` inside it is written by `serializeError` too, where the line meets it. `defaultSerialize(err)` keeps `cause`, an `errors` item or an `Error`-valued field as the `Error` itself, so it goes through `serializeError` afterwards: read `err.cause` itself, not `defaultSerialize(err).cause.message`. A loop is `"[Circular]"`, Errors nest up to 5 levels, the [Re-write Budget](#the-line) applies and so do the `limits` below. Returning the `Error` itself (or another one) writes its default shape.
+- It is your code, so it may throw. A log call still never throws: that `Error` is written in the default shape, with `serializeErrorFailed: "<the reason>"`.
+- It must return an object, synchronously. Anything else counts as a failure too, so the `Error` is never lost: `undefined`, `null` or another primitive is written as the default shape with `serializeErrorFailed: "serializeError returned undefined"` (or `null`, `a number`, ...), and a Promise (an `async` serializer) or another thenable with `"serializeError returned a Promise"` (or `a thenable`).
+- A line logged from inside `serializeError`, through any logger, writes each `Error` as only `{ type, message, serializeErrorFailed: "logged from inside serializeError" }`: no own properties, `cause` or `stack`, and `message` as it is (`omitErrorKeys(['message'])` doesn't apply there). So a synchronous serializer that logs can't call itself again, and can't write the keys it is there to leave out. That holds only while it runs: an `async` serializer (already a failure, see above) that logs after an `await` calls itself again. One exception, as on every line: an `Error` nested two or more levels deep whose class has its own `toJSON` is written by that `toJSON`.
+- Define it once, at module scope. The [Workers helpers](#per-environment) cache their Root Logger by the function, so a new function on each call (an arrow function written in a hook or in the call) builds a Root Logger each time. Those are garbage-collected with the function, but once an isolate has seen more than 16 functions, one `WARN` says `serializeError is a new function each call; define it once at module scope`. Like the env warnings, it is written whatever the configured level.
+- A Span that throws writes `span.error`, on its `span.end` or `<operation> failed` line: the thrown `Error`'s message as a plain string, not an `Error`. `serializeError` doesn't change it, so `omitErrorKeys(['message'])` leaves it in; only `maxStringLength` cuts it. `err` on the same line goes through `serializeError` as usual.
+
+#### `omitErrorKeys(keys, serializer?)`: leave out keys that hold user data
+
+Many library errors carry the request or response as own properties (the AI SDK's `APICallError` has `requestBodyValues`, the full prompt, and `responseBody`). `omitErrorKeys` leaves the keys you name out of every `Error`, at any depth, and lists the ones it left out as `omitted`:
+
+```ts
+import { createLogger, omitErrorKeys } from 'loggercf'
+
+const logger = createLogger({
+  service: 'api',
+  serializeError: omitErrorKeys(['requestBodyValues', 'responseBody']),
+})
+logger.error(apiCallError, 'llm failed')
+// "err":{"type":"APICallError","message":"rate limited","stack":"…","statusCode":429,"omitted":["requestBodyValues","responseBody"]}
+```
+
+- Only the `Error`'s own properties are left out, and `omitted` lists only those it had. An own `message`, `stack` or `cause` can be left out like any other key.
+- `type` is a Protected Field (see `maxRecordBytes` below), so it is never left out: it is always the class name. The default shape writes the class name as `type`, never an `Error`'s own `type` property. `'type'` in `keys` also replaces a `type` your serializer copied from that property with the class name, and lists `type` in `omitted` for an `Error` that has one.
+- loggercf has no list of its own. Which keys are unsafe or too large is your application's decision.
+- Without a second argument, the same keys (in any order, repeats ignored) give the same function, for up to 64 different key lists per isolate, so `omitErrorKeys([...])` written inline still gives a Workers helper one Root Logger.
+- To combine it with your own serializer, pass that as the second argument: `omitErrorKeys(['responseBody'], mySerializer)`. The keys are left out of what `mySerializer` returns, and out of anything it writes with `defaultSerialize`. When `mySerializer` throws or returns anything but an object, the `Error` is written in the default shape, still without the keys, with `serializeErrorFailed`. Each call with a second argument is a new function: make it once, at module scope.
+
+#### `limits`: keep each line under the platform's limit
+
+```ts
+const logger = createLogger({
+  service: 'api',
+  limits: { maxStringLength: 8_192, maxRecordBytes: 200_000 },
+})
+```
+
+- **`maxStringLength`** (an integer, 1 or more): a string value longer than this keeps its first `maxStringLength` characters, followed by `…[truncated from <original length> chars]`. It applies at any depth, to `message` and `err.message` too, and to the text of a `BigInt`, a function or a symbol. Keys are never cut, and neither are `time`, `level`, the trace IDs, `service`, `environment`, `version` or `err.type`.
+- **`maxRecordBytes`** (an integer, 1,024 or more): a line larger than this many bytes (UTF-8, as JSON) is trimmed until it fits, largest values first. A large string is cut just enough, with the same marker. A large object or array is trimmed inside, and a smaller one is replaced with `"[Trimmed: <bytes> bytes]"`. An array of many small items keeps its first items and ends with `"[Trimmed: <n> items, <bytes> bytes]"`. The Protected Fields stay whole: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. If the line still doesn't fit (thousands of small top-level fields, say), only the Protected Fields are kept, with `logError` saying so. If even those are too large, `message` and `err.message` are cut too, and as a last resort the line is `time`, `level` and `logError`.
+- A line that already fits costs at most one pass over its characters. Trimming one takes time about linear in its size: it reads the line back once, measures it once, and writes it once more (a 1 MB line takes tens of milliseconds). It never throws.
+
+Why production apps usually want `limits`: Workers Logs caps each log at 256 KB. Cloudflare's docs say ["a single log has a maximum size limit of 256 KB. Logs exceeding that size will be truncated and the log's `$cloudflare.truncated` field will be set to true"](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits). A line truncated there is no longer valid JSON, so its fields can't be queried. The [Workers limits](https://developers.cloudflare.com/workers/platform/limits/#log-size) also cap the log data of one request at 256 KB (`console.log` output, exceptions, request metadata and headers): past that, Cloudflare says it does not record additional context for that request in logs, tail logs or Tail Workers. A `maxRecordBytes` of `200_000` keeps each line valid and leaves room for the platform's own fields. It can't bound how many lines one request writes.
+
+#### Per environment
+
+Turn both on in production and leave them off locally, where you may want the whole payload while debugging:
+
+```ts
+import { createLogger, loggerOptionsFromEnv, omitErrorKeys } from 'loggercf'
+
+const production = env.ENVIRONMENT === 'production'
+const logger = createLogger({
+  ...loggerOptionsFromEnv(env),
+  ...(production && {
+    serializeError: omitErrorKeys(['requestBodyValues', 'responseBody']),
+    limits: { maxStringLength: 8_192, maxRecordBytes: 200_000 },
+  }),
+})
+```
+
+The Workers helpers build their Root Logger from env, so the limits come from the vars `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES` (see [Cloudflare Worker Requirements](#cloudflare-worker-requirements)). `serializeError` is code, so it can't come from env: `withLogging`, `withScheduled`, `withQueueMessage`, `withWorkflow` and `tracedWorker` take it as a `serializeError` option, and `defaultLoggerFromEnv(mapping, { serializeError })` as its second argument. A `TracedEntrypoint` sets both in its [`[TracedEntrypoint.loggerOptions]`](#tracedentrypointenv) hook. Pick the serializer at module scope from `env` (from `cloudflare:workers`):
+
+```jsonc
+// wrangler.jsonc
+{
+  "vars": { "NAME": "billing", "ENVIRONMENT": "development" },
+  "env": {
+    "production": {
+      "vars": {
+        "NAME": "billing",
+        "ENVIRONMENT": "production",
+        "LOG_MAX_STRING_LENGTH": "8192",
+        "LOG_MAX_RECORD_BYTES": "200000",
+      },
+    },
+  },
+}
+```
+
+```ts
+import { env } from 'cloudflare:workers'
+import { omitErrorKeys } from 'loggercf'
+import { withLogging, withQueueMessage, withScheduled } from 'loggercf/workers'
+
+const serializeError =
+  env.ENVIRONMENT === 'production'
+    ? omitErrorKeys(['requestBodyValues', 'responseBody'])
+    : undefined
+
+export default withLogging(BillingWorker, { serializeError })
+export const nightly = withScheduled(runNightly, { serializeError })
+
+// The same module-scope function in the message loop, never a new one per message:
+export const queueHandler = {
+  async queue(batch: MessageBatch<Order>) {
+    for (const message of batch.messages)
+      await withQueueMessage(batch, message, () => handle(message), { serializeError })
+  },
+}
+```
+
+A `TracedEntrypoint` reads the same module-scope function in its hook:
+
+```ts
+export class Api extends TracedEntrypoint<Env> {
+  protected override get [TracedEntrypoint.loggerOptions](): LoggerOptions {
+    return { ...super[TracedEntrypoint.loggerOptions], serializeError }
+  }
+}
+```
+
+Use one serializer function per Worker: the helpers share one Root Logger per isolate for the same env and the same `serializeError`, and a different function gets a Root Logger of its own. The hook is read on each request, and the helpers' options on each call, so a function written inline there (`serializeError: (err, d) => ...`) is a new one each time: see the `Define it once` bullet above.
+
+### Where a line goes
 
 Only the final write differs, detected at startup:
 
