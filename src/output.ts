@@ -203,15 +203,37 @@ function read(get: () => unknown): unknown {
   }
 }
 
+/** How many prototypes `isAggregateError()` looks at, so a `Proxy` whose prototype is itself can't loop it. */
+const MAX_PROTOTYPE_STEPS = 32
+
 /**
- * Whether `error` is an `AggregateError`, never throwing.
+ * Whether `error` is an `AggregateError`, from any realm, never throwing. A
+ * class of this realm is told by `instanceof`. One from another realm (a `vm`
+ * context) has its own `AggregateError`, so it is told by its own `errors`
+ * property (every `AggregateError` has one) together with an `AggregateError`
+ * class on its prototype chain, found by name. Own properties and constructors
+ * are read as data, so no getter runs and nothing is called. A fake `Error`,
+ * or a `Proxy` whose traps throw or loop, is `false`.
  *
  * @param {Error} error - An `Error`.
  * @returns {boolean} `true` for an `AggregateError`.
  */
 function isAggregateError(error: Error): error is AggregateError {
   try {
-    return typeof AggregateError === 'function' && error instanceof AggregateError
+    if (typeof AggregateError === 'function' && error instanceof AggregateError) return true
+    // Most Errors stop here, with no `errors` of their own.
+    if (!Object.prototype.hasOwnProperty.call(error, 'errors')) return false
+    let proto: unknown = Object.getPrototypeOf(error)
+    for (let i = 0; i < MAX_PROTOTYPE_STEPS && proto !== null && typeof proto === 'object'; i++) {
+      const constructor = Object.getOwnPropertyDescriptor(proto, 'constructor')?.value as unknown
+      if (
+        typeof constructor === 'function' &&
+        Object.getOwnPropertyDescriptor(constructor, 'name')?.value === 'AggregateError'
+      )
+        return true
+      proto = Object.getPrototypeOf(proto)
+    }
+    return false
   } catch {
     return false
   }
@@ -355,7 +377,9 @@ function spend(budget: Budget, cost: Cost): boolean {
  *
  * Shape: `{ type, message, stack, ...own enumerable props, errors?, cause? }`.
  * `cause`, every own property that is an `Error`, and an `AggregateError`'s
- * `errors` have the same shape, nested up to `MAX_CAUSE_DEPTH` levels. Any
+ * `errors` (from any realm) have the same shape, nested up to `MAX_CAUSE_DEPTH`
+ * levels. An own `toJSON` function is `functionText()`, never copied as a
+ * function, which `JSON.stringify` would call. Any
  * other value is kept as it is: the walk of `stringifyRecord()` serializes an
  * `Error` inside one with this same function, nested in this one. An `Error`
  * nested inside itself (`e.self = e`, a `cause` loop) is `"[Circular]"`
@@ -452,7 +476,8 @@ function fillError(out: LogRecord, error: Error, nested: (value: unknown) => unk
   }
   for (const [key, value] of entries) {
     if (key in out || key === 'cause') continue
-    out[key] = nested(value)
+    // As a Record Key: a copy with a `toJSON` method would be written by it, so the `Error` could be anything.
+    out[key] = key === 'toJSON' && typeof value === 'function' ? functionText(value) : nested(value)
   }
   // Not enumerable, so not among the entries.
   if (!('errors' in out) && isAggregateError(error))
