@@ -143,34 +143,120 @@ export function utf8Bytes(line: string): number {
   return bytes
 }
 
+/** A string this long or longer has its size kept in `Sizes`: measuring it again would cost. */
+const LONG_TEXT = 4096
+
+/** A container with this many items or keys or more has its `Entries` kept in `Sizes`. */
+const WIDE = 256
+
+/** What `sizeOf()` keeps of a wide container: its keys, and the bytes of each value. */
+interface Entries {
+  /** An object's keys, in order; `undefined` for an array. */
+  keys: string[] | undefined
+  /** The bytes of each item, or of each key's value, as measured before any is trimmed. */
+  values: number[]
+}
+
+/** What `sizeOf()` measured so far, so nothing is measured twice. */
+interface Sizes {
+  /** The bytes of each container larger than `MIN_TRIMMABLE`, and of each long string (see `LONG_TEXT`). */
+  bytes: Map<unknown, number>
+  /** The `Entries` of each wide container (see `WIDE`): reading the keys of a wide object again would cost. */
+  entries: Map<object, Entries>
+}
+
+/**
+ * Nothing measured yet.
+ *
+ * @returns {Sizes} An empty `Sizes`.
+ */
+const newSizes = (): Sizes => ({ bytes: new Map(), entries: new Map() })
+
 /**
  * The UTF-8 size of a JSON value as `JSON.stringify` writes it. A container's
- * is kept in `sizes`, so each one is measured once.
+ * is kept in `sizes`, so each one is measured once (one of `MIN_TRIMMABLE`
+ * bytes or less is cheap to measure again, and is never trimmed), and so is a
+ * long string's (see `LONG_TEXT`) and a wide container's `Entries`. A number
+ * JSON can't write (`NaN`, `Infinity`) is `null`, as `JSON.stringify` writes it.
  *
- * @param {unknown} value - A value from `JSON.parse`.
- * @param {Map<object, number>} sizes - The containers measured so far.
+ * @param {unknown} value - A value from `JSON.parse`, or a JSON-ready copy (see `fitValue()`).
+ * @param {Sizes} sizes - What is measured so far.
  * @returns {number} Its bytes.
  */
-function sizeOf(value: unknown, sizes: Map<object, number>): number {
-  if (typeof value === 'string') return stringBytes(value)
+function sizeOf(value: unknown, sizes: Sizes): number {
+  if (typeof value === 'string') {
+    if (value.length < LONG_TEXT) return stringBytes(value)
+    let bytes = sizes.bytes.get(value)
+    if (bytes === undefined) {
+      bytes = stringBytes(value)
+      sizes.bytes.set(value, bytes)
+    }
+    return bytes
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value).length : 4
   if (typeof value !== 'object' || value === null) return String(value).length
-  const known = sizes.get(value)
+  const known = sizes.bytes.get(value)
   if (known !== undefined) return known
   let bytes = 2
+  let keys: string[] | undefined
+  let values: number[] | undefined
   if (Array.isArray(value)) {
-    for (const item of value) bytes += sizeOf(item, sizes) + 1
+    if (value.length >= WIDE) values = []
+    for (const item of value) {
+      const size = sizeOf(item, sizes)
+      values?.push(size)
+      bytes += size + 1
+    }
     if (value.length > 0) bytes--
   } else {
-    const keys = Object.keys(value)
-    for (const key of keys) bytes += stringBytes(key) + 1 + sizeOf((value as Tree)[key], sizes) + 1
+    keys = Object.keys(value)
+    if (keys.length >= WIDE) values = []
+    for (const key of keys) {
+      const size = sizeOf((value as Tree)[key], sizes)
+      values?.push(size)
+      bytes += stringBytes(key) + 1 + size + 1
+    }
     if (keys.length > 0) bytes--
   }
-  sizes.set(value, bytes)
+  if (values) sizes.entries.set(value, { keys, values })
+  if (bytes > MIN_TRIMMABLE) sizes.bytes.set(value, bytes)
   return bytes
 }
 
+/**
+ * The bytes of the value at `i` in a container: kept in its `Entries` when it
+ * is wide and the value is of `MIN_TRIMMABLE` bytes or less (it is never
+ * trimmed, so that never changes), else measured (see `sizeOf()`).
+ *
+ * @param {unknown} value - The value.
+ * @param {number} i - Its index in its container's items or keys.
+ * @param {Entries | undefined} entries - What `sizeOf()` kept of the container.
+ * @param {Sizes} sizes - What is measured so far.
+ * @returns {number} Its bytes.
+ */
+function entrySize(value: unknown, i: number, entries: Entries | undefined, sizes: Sizes): number {
+  const kept = entries?.values[i]
+  return kept !== undefined && kept <= MIN_TRIMMABLE ? kept : sizeOf(value, sizes)
+}
+
+/**
+ * The keys of an object, from its `Entries` when `sizeOf()` kept them.
+ *
+ * @param {Tree} node - The object.
+ * @param {Sizes} sizes - What is measured so far.
+ * @returns {string[]} Its keys, in order.
+ */
+const keysOf = (node: Tree, sizes: Sizes): string[] =>
+  sizes.entries.get(node)?.keys ?? Object.keys(node)
+
 /** A `cutMarker()` at the end of a string, with the length it holds. */
 const ENDS_WITH_CUT = /…\[truncated from (\d+) chars\]$/
+
+/** How a `cutMarker()` starts. */
+const CUT_MARKER_START = '…[truncated from '
+
+/** How a `cutMarker()` ends. */
+const CUT_MARKER_END = ' chars]'
 
 /**
  * `text` trimmed to the longest prefix that, with `cutMarker()`, is a JSON
@@ -183,11 +269,15 @@ const ENDS_WITH_CUT = /…\[truncated from (\d+) chars\]$/
  * @returns {string} The trimmed string.
  */
 function cutToBytes(text: string, bytes: number): string {
-  const found = ENDS_WITH_CUT.exec(text)
+  // Only the last marker start can match (digits never hold one): a search of the whole of a
+  // long string would cost.
+  const start = text.endsWith(CUT_MARKER_END) ? text.lastIndexOf(CUT_MARKER_START) : -1
+  const found = start < 0 ? null : ENDS_WITH_CUT.exec(text.slice(start))
+  const index = found ? start : -1
   // A real earlier cut kept fewer characters than it says the string had; a
   // string that only ends like a marker is cut as it is.
-  const already = found && Number(found[1]) > found.index ? found : null
-  const kept = already ? text.slice(0, already.index) : text
+  const already = found && Number(found[1]) > index ? found : null
+  const kept = already ? text.slice(0, index) : text
   const marker = cutMarker(already ? Number(already[1]) : text.length)
   let room = bytes - stringBytes(marker)
   let end = 0
@@ -331,18 +421,20 @@ const droppedItemsMarker = (items: number, bytes: number): string =>
  *
  * @param {unknown[]} list - The array. Mutated.
  * @param {number} need - How many bytes to take out.
- * @param {Map<object, number>} sizes - The sizes measured so far.
+ * @param {Sizes} sizes - The sizes measured so far.
  * @returns {number} How many bytes it took out; `0` when that would save nothing.
  */
-function dropTail(list: unknown[], need: number, sizes: Map<object, number>): number {
+function dropTail(list: unknown[], need: number, sizes: Sizes): number {
+  const entries = sizes.entries.get(list)
   const { taken, bytes, saved } = tailToDrop(
     list.length,
-    (i) => sizeOf(list[i], sizes),
+    (i) => entrySize(list[i], i, entries, sizes),
     (items, removed) => droppedItemsMarker(items, removed).length + 2,
     need,
   )
   if (saved <= 0) return 0
   list.splice(list.length - taken.length, taken.length, droppedItemsMarker(taken.length, bytes))
+  sizes.entries.delete(list)
   return saved
 }
 
@@ -365,17 +457,13 @@ const droppedKeysMarker = (keys: number, bytes: number): string =>
  *
  * @param {Tree} node - The object. Mutated.
  * @param {number} need - How many bytes to take out.
- * @param {Map<object, number>} sizes - The sizes measured so far.
+ * @param {Sizes} sizes - The sizes measured so far.
  * @param {NodeKind} kind - What the object is (see `shrink()`).
  * @returns {number} How many bytes it took out; `0` when that would save nothing.
  */
-function dropTailKeys(
-  node: Tree,
-  need: number,
-  sizes: Map<object, number>,
-  kind: NodeKind,
-): number {
-  const keys = Object.keys(node)
+function dropTailKeys(node: Tree, need: number, sizes: Sizes, kind: NodeKind): number {
+  const entries = sizes.entries.get(node)
+  const keys = entries?.keys ?? Object.keys(node)
   // The shortest of the marker keys that is free, or about to be dropped.
   let markerKey = TRIMMED_KEY
   while (Object.hasOwn(node, markerKey)) markerKey += '_'
@@ -384,8 +472,9 @@ function dropTailKeys(
     (i) => {
       const key = keys[i]
       if (staysInTail(kind, key)) return undefined
-      if (key.length < markerKey.length && TRIMMED_KEYS.test(key)) markerKey = key
-      return stringBytes(key) + 1 + sizeOf(node[key], sizes)
+      if (key.length < markerKey.length && key.startsWith('[') && TRIMMED_KEYS.test(key))
+        markerKey = key
+      return stringBytes(key) + 1 + entrySize(node[key], i, entries, sizes)
     },
     (count, removed) => stringBytes(markerKey) + 1 + droppedKeysMarker(count, removed).length + 2,
     need,
@@ -393,6 +482,7 @@ function dropTailKeys(
   if (saved <= 0) return 0
   for (const i of taken) delete node[keys[i]]
   node[markerKey] = droppedKeysMarker(taken.length, bytes)
+  sizes.entries.delete(node)
   return saved
 }
 
@@ -432,26 +522,25 @@ const replacementBytes = (value: unknown, size: number): number =>
  *
  * @param {Tree | unknown[]} node - A container. Mutated.
  * @param {number} need - How many bytes to take out.
- * @param {Map<object, number>} sizes - The sizes measured so far (see `sizeOf()`).
+ * @param {Sizes} sizes - The sizes measured so far (see `sizeOf()`).
  * @param {NodeKind} kind - What `node` is: what is protected in it.
  * @returns {number} How many bytes it took out.
  */
-function shrink(
-  node: Tree | unknown[],
-  need: number,
-  sizes: Map<object, number>,
-  kind: NodeKind,
-): number {
-  const keys = Array.isArray(node) ? node.map((_, i) => String(i)) : Object.keys(node)
+function shrink(node: Tree | unknown[], need: number, sizes: Sizes, kind: NodeKind): number {
+  const keys = Array.isArray(node) ? node.map((_, i) => String(i)) : keysOf(node, sizes)
+  const kept = sizes.entries.get(node)
   const entries: [string, number][] = []
   // What replacing every value above `MIN_TRIMMABLE` could take out.
   let reachable = 0
-  for (const key of keys) {
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]
     if (isProtected(kind, key)) continue
     const value = (node as Tree)[key]
-    const size = sizeOf(value, sizes)
+    const size = entrySize(value, i, kept, sizes)
+    // A smaller one is never trimmed on its own: the loop below stops at the first.
+    if (size <= MIN_TRIMMABLE) continue
     entries.push([key, size])
-    if (size > MIN_TRIMMABLE) reachable += size - replacementBytes(value, size)
+    reachable += size - replacementBytes(value, size)
   }
   entries.sort((a, b) => b[1] - a[1])
   const wholesale = reachable >= need
@@ -464,7 +553,7 @@ function shrink(
     const value = (node as Tree)[key]
     if (kind === 'root' && key === 'err' && isContainer(value) && !Array.isArray(value)) {
       const inside = shrink(value, left, sizes, 'err')
-      sizes.set(value, size - inside)
+      sizes.bytes.set(value, size - inside)
       saved += inside
       continue
     }
@@ -480,7 +569,7 @@ function shrink(
     if (!isContainer(value)) continue
     if (size > left + SMALL) {
       const inside = shrink(value, left, sizes, 'value')
-      sizes.set(value, size - inside)
+      sizes.bytes.set(value, size - inside)
       if (inside >= left) {
         saved += inside
         continue
@@ -660,7 +749,80 @@ function minimalLine(source: Tree, max: number): string {
 
 /**
  * The line, made to fit `maxRecordBytes` (in UTF-8 bytes). A line that
- * already fits is returned as is. A larger one is read back and trimmed:
+ * already fits is returned as is. A larger one is read back and trimmed (see
+ * `fitValue()`). Never throws.
+ *
+ * @param {string} line - The JSON line.
+ * @param {Record<string, unknown>} record - The record it was written from, for the last resort.
+ * @param {number} max - `maxRecordBytes`: 1,024 or more.
+ * @returns {string} A line of at most `max` bytes.
+ */
+export function fitLine(line: string, record: Record<string, unknown>, max: number): string {
+  if (fits(line, max)) return line
+  let root: Tree
+  try {
+    root = JSON.parse(line) as Tree
+  } catch {
+    return lastResort(record, record, max)
+  }
+  return fitValue(root, record, max, line)
+}
+
+/**
+ * Whether a line is at most `max` bytes, without counting them when its
+ * length alone tells.
+ *
+ * @param {string} line - The JSON line.
+ * @param {number} max - `maxRecordBytes`.
+ * @returns {boolean} `true` when it fits.
+ */
+function fits(line: string, max: number): boolean {
+  // A code unit is at most 3 bytes, and at least 1.
+  if (line.length * 3 <= max) return true
+  return line.length <= max && utf8Bytes(line) <= max
+}
+
+/**
+ * The line of a JSON-ready copy of a record (plain objects and arrays,
+ * strings, numbers, booleans and `null`, no object in two places, as the
+ * walk of `output.ts` builds it, or `JSON.parse` does), made to fit
+ * `maxRecordBytes`: the same line as `fitLine(JSON.stringify(copy), ...)`, but
+ * a line over the limit is trimmed from the copy, never read back. Without
+ * `line`, the copy is measured first and written only when it fits, so a
+ * large line is never written whole; with it, `line` is returned when it fits.
+ *
+ * @param {Record<string, unknown>} copy - The copy. Mutated when its line is too large.
+ * @param {Record<string, unknown>} record - The record it was made from, for the last resort.
+ * @param {number} max - `maxRecordBytes`: 1,024 or more.
+ * @param {string} [line] - The copy's line, when it is already written.
+ * @returns {string} A line of at most `max` bytes.
+ * @throws Only what `JSON.stringify` of the copy throws: a `RangeError` for a copy nested too deep for the stack, or a line too long for a string.
+ */
+export function fitValue(
+  copy: Record<string, unknown>,
+  record: Record<string, unknown>,
+  max: number,
+  line?: string,
+): string {
+  if (line !== undefined && fits(line, max)) return line
+  // Measured as a tree, not as a line: what `shrink()` measures is then measured once.
+  const sizes = newSizes()
+  let bytes: number
+  try {
+    bytes = sizeOf(copy, sizes)
+  } catch {
+    return line === undefined
+      ? fitLine(JSON.stringify(copy), record, max)
+      : lastResort(copy, record, max)
+  }
+  // A `line` that does not fit is never written again as it is: `fitTree()` writes the copy.
+  if (line === undefined && bytes <= max) return JSON.stringify(copy)
+  return fitTree(copy, bytes, sizes, record, max)
+}
+
+/**
+ * A record read back from its line, or its JSON-ready copy, trimmed to fit
+ * `maxRecordBytes`:
  *
  * 1. its largest values first, but the Protected Fields (`time`, `level`,
  *    `message`, the trace IDs, `service`, `environment`, `version`, and
@@ -676,37 +838,47 @@ function minimalLine(source: Tree, max: number): string {
  * Each step measures the line once and writes it once, so the work is about
  * linear in its size. Never throws.
  *
- * @param {string} line - The JSON line.
+ * @param {Tree} root - The record. Mutated.
+ * @param {number} bytes - The size of its line, over `max`.
+ * @param {Sizes} sizes - What is measured of it so far (see `sizeOf()`).
  * @param {Record<string, unknown>} record - The record it was written from, for the last resort.
  * @param {number} max - `maxRecordBytes`: 1,024 or more.
  * @returns {string} A line of at most `max` bytes.
  */
-export function fitLine(line: string, record: Record<string, unknown>, max: number): string {
-  // A code unit is at most 3 bytes, and at least 1.
-  if (line.length * 3 <= max) return line
-  let bytes: number
-  if (line.length <= max) {
-    bytes = utf8Bytes(line)
-    if (bytes <= max) return line
-  } else bytes = utf8Bytes(line)
-  let source: Tree = record
+function fitTree(
+  root: Tree,
+  bytes: number,
+  sizes: Sizes,
+  record: Record<string, unknown>,
+  max: number,
+): string {
   try {
-    let root = JSON.parse(line) as Tree
-    source = root
-    const sizes = new Map<object, number>()
     shrink(root, bytes - max, sizes, 'root')
     let out = JSON.stringify(root)
     if (utf8Bytes(out) <= max) return out
-    root = protectedOnly(root, bytes, max)
-    out = JSON.stringify(root)
+    const kept = protectedOnly(root, bytes, max)
+    out = JSON.stringify(kept)
     const size = utf8Bytes(out)
     if (size <= max) return out
-    cutMessages(root, size - max)
-    out = JSON.stringify(root)
+    cutMessages(kept, size - max)
+    out = JSON.stringify(kept)
     if (utf8Bytes(out) <= max) return out
   } catch {
     // Fall through to the last resort.
   }
+  return lastResort(root, record, max)
+}
+
+/**
+ * `minimalLine()` from `source`, or from only the `time` and `level` of
+ * `record` when `source` can't be read. Never throws.
+ *
+ * @param {Tree} source - The record read back from its line, or the record itself.
+ * @param {Record<string, unknown>} record - The record the line was written from.
+ * @param {number} max - `maxRecordBytes`.
+ * @returns {string} The line.
+ */
+function lastResort(source: Tree, record: Record<string, unknown>, max: number): string {
   try {
     return minimalLine(source, max)
   } catch {
