@@ -672,6 +672,44 @@ const ownCopies = (out: unknown, count: number) =>
     (_, i) => (out as Record<string, { cause: { cause: unknown } }>)[`q${i}`].cause.cause,
   ).filter((cause) => cause !== '[Circular]').length
 
+/** An `Error` with no `stack`, so a line of many stays small. */
+const stackless = (message: string): Error => {
+  const error = new Error(message)
+  error.stack = undefined
+  return error
+}
+
+/** A `stackless()` Error as it is written: its `type`, its `message`, and `props`. */
+const shape = (message: string, props: Record<string, unknown>) => ({
+  type: 'Error',
+  message,
+  ...props,
+})
+
+/**
+ * The graph of issue #43: `a -> b -> a` (the cause of `a` is `b`, and `b`
+ * holds `a`), reached first as `w3 -> w4 -> a`, then from `w2`, which holds
+ * `b`. Under `w3`, `a` is copied at depth 2, with `b` at depth 3 inside it.
+ * Under `w2`, `b` is at depth 1, and `a` at depth 2 again: the copy of `a`
+ * made under `w3` still fits its depth and its `"[Circular]"`s, but holds a
+ * copy of `b`, which is now an ancestor.
+ *
+ * @param link - How `b` holds `a` and `w2` holds `b`: in an object (`{ a }`), or as the `Error` itself.
+ * @param aProps - Own properties for `a`.
+ */
+function nestedInItself(
+  link: (error: Error) => unknown,
+  aProps: Record<string, unknown> = {},
+): { w3: Error; w2: Error } {
+  const a = Object.assign(stackless('a'), aProps)
+  const b = Object.assign(stackless('b'), { ctx2: link(a) })
+  a.cause = b
+  const w4 = Object.assign(stackless('W4'), { cause: a })
+  const w3 = Object.assign(stackless('W3'), { cause: w4 })
+  const w2 = Object.assign(stackless('W2'), { ctx: link(b) })
+  return { w3, w2 }
+}
+
 describe('an Error is serialized once per line', () => {
   beforeEach(() => _reset())
 
@@ -728,6 +766,52 @@ describe('an Error is serialized once per line', () => {
       p: { message: 'x', cause: { message: 'z', cause: '[Circular]' } },
       q: { message: 'y', cause: { message: 'z', cause: { message: 'x', cause: '[Circular]' } } },
     })
+  })
+
+  it('a reused copy never writes an Error inside itself (#43)', () => {
+    const entries = _captureEntries()
+    const logger = createLogger({ service: 'svc' })
+    const viaObjects = nestedInItself((e) => ({ e }))
+    logger.error({ list: [viaObjects.w3, viaObjects.w2] }, 'through objects')
+    const direct = nestedInItself((e) => e)
+    logger.error({ list: [direct.w3, direct.w2] }, 'as fields')
+    logger.error({ w3: direct.w3, w2: direct.w2 }, 'at the top level')
+    // Under W3: the cycle `a -> b -> a` is cut where `a` comes again, as before.
+    const a3 = (ctx2: unknown) => shape('a', { cause: shape('b', { ctx2 }) })
+    // Under W2: `b -> a`, whose cause is `b` again, so it is `"[Circular]"`, not `b` written again.
+    const a2 = shape('a', { cause: '[Circular]' })
+    expect(entries[0].list).toEqual([
+      shape('W3', { cause: shape('W4', { cause: a3({ e: '[Circular]' }) }) }),
+      shape('W2', { ctx: { e: shape('b', { ctx2: { e: a2 } }) } }),
+    ])
+    const asFields = [
+      shape('W3', { cause: shape('W4', { cause: a3('[Circular]') }) }),
+      shape('W2', { ctx: shape('b', { ctx2: a2 }) }),
+    ]
+    expect(entries[1].list).toEqual(asFields)
+    expect(entries[2]).toMatchObject({ w3: asFields[0], w2: asFields[1] })
+  })
+
+  it('a reused copy that holds an ancestor, 1,000 times: within the Re-write Budget', () => {
+    const lines: string[] = []
+    _setSink({ write: (record) => lines.push(stringifyRecord(record)) })
+    // `a` is wide: each copy of it written again costs 5,000 values, half the budget.
+    const { w3, w2 } = nestedInItself((e) => ({ e }), wide(5000))
+    const list = Array.from({ length: 1000 }, (_, i) => [
+      Object.assign(stackless(`x${i}`), { cause: w3 }),
+      Object.assign(stackless(`y${i}`), { cause: w2 }),
+    ]).flat()
+    const ms = elapsed(() => createLogger({ service: 'svc' }).error({ list }, 'm'))
+    expect(ms).toBeLessThan(500)
+    // One copy of `a` (63 KB), one more within the budget, and the 2,000 small outer Errors.
+    expect(lines[0].length).toBeLessThan(300_000)
+    const written = JSON.parse(lines[0]).list as { cause: unknown }[]
+    expect(written).toHaveLength(2000)
+    // The first `y`: `w2 -> b -> a`, whose cause is `"[Circular]"`, not `b` again.
+    expect(written[1].cause).toMatchObject({
+      ctx: { e: { message: 'b', ctx2: { e: { message: 'a', k4999: 4999, cause: '[Circular]' } } } },
+    })
+    expect(written.at(-1)!.cause).toBe('[Repeated]')
   })
 
   it('a dense Error graph with cycles stays fast', () => {
