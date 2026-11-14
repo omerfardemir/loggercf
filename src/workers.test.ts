@@ -39,6 +39,7 @@ import type { EnvMapping, SessionInit, TracedServiceBinding } from './workers'
 import type { Logger, LoggerOptions } from './types'
 import { brokenLogger } from './test-helpers'
 import { omitErrorKeys } from './omit'
+import { redactKeys } from './redact'
 import {
   runWithLogger,
   getTraceContext,
@@ -2509,5 +2510,109 @@ describe('serializeError and limits in the Workers helpers', () => {
     expect(defaultLoggerFromEnv()).not.toBe(logger)
     logger.error(errorWithBody(), 'm')
     expect(entries[0]!.err).toMatchObject({ omitted: ['body'] })
+  })
+})
+
+/** An Error with a key the application redacts. */
+const errorWithToken = () => Object.assign(new Error('failed'), { token: 'secret' })
+
+describe('redact in the Workers helpers', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    _reset()
+    for (const key of Object.keys(workersEnv)) delete workersEnv[key]
+  })
+
+  const redact = redactKeys(['token'])
+
+  class FailSession extends TracedSession {
+    fail() {
+      return this.traced(() => {
+        throw errorWithToken()
+      }, 'op.fail')
+    }
+  }
+
+  it('tracedWorker: redact from the options', () => {
+    const entries = _captureEntries()
+    const Worker = tracedWorker(FailSession, { redact })
+    expect(() =>
+      new Worker(undefined, { NAME: 'svc' }).session({ traceparent: SPAN_SAMPLED }).fail(),
+    ).toThrow('failed')
+    expect(entries[0]!.err).toMatchObject({ token: '[REDACTED]' })
+    expect(JSON.stringify(entries)).not.toContain('secret')
+  })
+
+  it('withLogging: redact from the options; it is part of "the same options"', () => {
+    const entries = _captureEntries()
+    class Worker extends WorkerEntrypoint {
+      fail() {
+        throw errorWithToken()
+      }
+    }
+    const Logged = withLogging(Worker, { redact })
+    expect(withLogging(Logged, { redact: redactKeys(['TOKEN']) })).toBe(Logged)
+    expect(() => withLogging(Logged)).toThrow('already wrapped with other options')
+    expect(() => withLogging(Logged, { redact: redactKeys(['other']) })).toThrow(
+      'already wrapped with other options',
+    )
+    expect(() => new Logged({} as any, { NAME: 'svc' }).fail()).toThrow('failed')
+    expect(entries[0]!.err).toMatchObject({ token: '[REDACTED]' })
+  })
+
+  it('withLogging: redact false is the same options as none', () => {
+    class Worker extends WorkerEntrypoint {}
+    const Logged = withLogging(Worker)
+    expect(withLogging(Logged, { redact: false })).toBe(Logged)
+  })
+
+  it('withLogging(TracedEntrypoint) with redact throws: use its Logger Options hook', () => {
+    class Entry extends TracedEntrypoint {}
+    expect(() => withLogging(Entry, { redact })).toThrow(
+      '[TracedEntrypoint.loggerOptions] getter instead of passing redact',
+    )
+  })
+
+  it('TracedEntrypoint: the Logger Options hook sets redact per environment; one Root Logger', () => {
+    const entries = _captureEntries()
+    class Entry extends TracedEntrypoint<{ ENVIRONMENT?: string }> {
+      protected override get [TracedEntrypoint.loggerOptions](): LoggerOptions {
+        const options = super[TracedEntrypoint.loggerOptions]
+        return {
+          ...options,
+          redact: this.env.ENVIRONMENT === 'production' && redactKeys(['token']),
+        }
+      }
+      session(init: SessionInit) {
+        return new FailSession(init, this[TracedEntrypoint.rootLogger], this.env)
+      }
+    }
+    const fail = (env: { ENVIRONMENT?: string }) =>
+      expect(() => new Entry({} as any, env).session({ traceparent: SPAN_SAMPLED }).fail()).toThrow(
+        'failed',
+      )
+    fail({ ENVIRONMENT: 'production' })
+    fail({ ENVIRONMENT: 'development' })
+    expect(entries.map((e) => (e.err as Record<string, unknown>).token)).toEqual([
+      '[REDACTED]',
+      'secret',
+    ])
+    const roots = new Set<Logger>()
+    for (let i = 0; i < 100; i++) {
+      const entry = new Entry({} as any, { ENVIRONMENT: 'production' }) as any
+      roots.add(entry[TracedEntrypoint.rootLogger])
+    }
+    expect(roots.size).toBe(1)
+  })
+
+  it('defaultLoggerFromEnv: redact in its second argument; each redactor its own Root Logger', () => {
+    Object.assign(workersEnv, { NAME: 'svc' })
+    const entries = _captureEntries()
+    const logger = defaultLoggerFromEnv(undefined, { redact })
+    expect(defaultLoggerFromEnv(undefined, { redact: redactKeys(['token']) })).toBe(logger)
+    expect(defaultLoggerFromEnv()).not.toBe(logger)
+    expect(defaultLoggerFromEnv(undefined, { redact: false })).toBe(defaultLoggerFromEnv())
+    logger.error(errorWithToken(), 'm')
+    expect(entries[0]!.err).toMatchObject({ token: '[REDACTED]' })
   })
 })

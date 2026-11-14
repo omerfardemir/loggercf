@@ -237,6 +237,86 @@ export interface LineLimits {
 }
 
 /**
+ * Redacts a Root Logger's lines: the `redact` Logger Option. Off unless it is
+ * set, so a local run can still print everything; loggercf has no list of
+ * sensitive keys of its own. `redactKeys()` builds one from the keys the
+ * application names.
+ *
+ * Runs on the finished line, after Argument Routing and `Error` serialization,
+ * so it sees `message`, the fields, Context Fields, bindings, `err`, `errors`,
+ * `args`, and every `Error` at any depth in its serialized shape. It never sees
+ * the top-level `time`, `level`, `traceId`, `spanId` or `parentSpanId`, which
+ * are written as they are. It runs before the Line Limits, so `maxStringLength`
+ * and `maxRecordBytes` measure what is written.
+ *
+ * What either hook returns is not trusted: it is written by the same rules as a
+ * log call's values (`"[Circular]"`, the Re-write Budget, the Line Limits). A
+ * hook that throws never loses the line: see each hook. A line logged while a
+ * hook runs (its own code logs), through any logger with a `redact`, is written
+ * as only `time`, `level`, the trace IDs and `redactFailed: 'logged from inside
+ * redact'`, so a hook can neither call itself again nor write what it was there
+ * to hide.
+ *
+ * @example
+ * ```ts
+ * const redact: Redactor = {
+ *   value: (value, path) => (path.at(-1) === 'email' ? '[email]' : value),
+ * }
+ * const logger = createLogger({ service: 'api', redact: env.ENVIRONMENT === 'production' ? redact : false })
+ * ```
+ */
+export interface Redactor {
+  /**
+   * Called for each value of the line, before what is inside it, with its path
+   * from the top of the line. Return the value to write: the same value to keep
+   * it (and have what is inside it passed on, one by one), or a replacement,
+   * which is written as it is, without being passed to `value()` again.
+   *
+   * A value is passed as it will be written: a `Date` (or anything with a
+   * `toJSON`) as what its `toJSON` returns, a `BigInt`, a function or a symbol as
+   * its text, an `Error` as its serialized shape. A `Map` or a `Set`, a class
+   * instance and an array are passed as they are, then their items. `undefined`,
+   * which writes nothing, and the `"[Circular]"` stand-in are never passed. Never
+   * change a value in place: it may be the application's own object.
+   *
+   * The path is the keys from the top of the line: an array item's index is its
+   * key (`['args', '0', 'token']`), an `Error`'s properties are keys of its
+   * serialized shape (`['err', 'cause', 'message']`, `['errors', '1', 'stack']`),
+   * and a `Map` is an array of `[key, value]` pairs, where a string key is the path
+   * key of its value (`['headers', '0', 'authorization']`; `['headers', '0', '1']`
+   * for any other key). The same array is reused for every call: copy it
+   * to keep it.
+   *
+   * Returning `undefined` leaves the key out, as JSON does (`null` in an
+   * array). When it throws, or returns a Promise, the value is written as
+   * `"[Redaction failed: <name>]"` (the error's name, never its message), and
+   * one WARN per isolate names the hook and the path.
+   */
+  value?(value: unknown, path: readonly string[]): unknown
+  /**
+   * Called once per line, after `value()`, with the whole line but `time`,
+   * `level` and the trace IDs, as JSON data (ordinary objects and arrays; an own
+   * `__proto__` key stays a key). Return the line to write, a plain object: it may be the one it
+   * was given, changed in place. The keys it was not given are written by
+   * loggercf whatever it returns.
+   *
+   * When it throws, or returns anything but a plain object (a Promise
+   * included), the line fails closed: only `time`, `level`, the trace IDs and
+   * `redactFailed` naming the failure are written, no field, and one WARN per
+   * isolate.
+   */
+  record?(record: Record<string, unknown>): Record<string, unknown>
+}
+
+/**
+ * Options for `redactKeys()`.
+ */
+export interface RedactKeysOptions {
+  /** What a value under a matching key is written as. Default `'[REDACTED]'`. */
+  censor?: string
+}
+
+/**
  * Options for creating a Logger instance.
  *
  * @example
@@ -272,6 +352,13 @@ export interface LoggerOptions {
   serializeError?: ErrorSerializer
   /** The Line Limits: size limits on each line. Off by default. */
   limits?: LineLimits
+  /**
+   * Redacts every line of this logger (see `Redactor` and `redactKeys()`).
+   * Omitted, `false` or any other falsy value: nothing is redacted, the default. Choose it per
+   * environment in code, e.g. on in production and off locally. Define it once,
+   * at module scope: the Workers helpers cache their Root Logger by this object.
+   */
+  redact?: Redactor | false
 }
 
 /**

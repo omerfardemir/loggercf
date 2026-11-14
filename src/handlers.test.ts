@@ -34,6 +34,8 @@ vi.mock('cloudflare:workers', () => ({
 import { WorkerEntrypoint, WorkflowEntrypoint, type WorkflowStep } from 'cloudflare:workers'
 import { withQueueMessage, withScheduled, withWorkflow, tracedStep } from './workers'
 import { omitErrorKeys } from './omit'
+import { redactKeys } from './redact'
+import { envRootLogger } from './workers-shared'
 import {
   _captureEntries,
   _getDefaultLogger,
@@ -922,5 +924,69 @@ describe('serializeError and limits in the handler helpers', () => {
     await record(controller(), ENV, {} as ExecutionContext)
     await withScheduled(() => {}, { serializeError })(controller(), ENV, {} as ExecutionContext)
     expect(loggers.size).toBe(1)
+  })
+})
+
+/** An Error with a key the application redacts. */
+const errorWithToken = () => Object.assign(new Error('failed'), { token: 'secret' })
+
+describe('redact in the handler helpers', () => {
+  const redact = redactKeys(['token'])
+
+  it('withScheduled: redact from the options', async () => {
+    const entries = _captureEntries()
+    const handler = withScheduled(
+      () => {
+        getLogger().info({ token: 't' }, 'tick')
+        throw errorWithToken()
+      },
+      { redact },
+    )
+    await expect(
+      Promise.resolve().then(() => handler(controller(), ENV, {} as ExecutionContext)),
+    ).rejects.toThrow('failed')
+    expect(linesOf(entries, 'tick')[0]!.token).toBe('[REDACTED]')
+    expect(linesOf(entries, 'span.end scheduled')[0]!.err).toMatchObject({ token: '[REDACTED]' })
+    expect(JSON.stringify(entries)).not.toContain('secret')
+  })
+
+  it('withQueueMessage: an inline redactKeys in the message loop gives one Root Logger', async () => {
+    const entries = _captureEntries()
+    Object.assign(workersEnv, ENV)
+    const roots = new Set<unknown>()
+    for (let i = 0; i < 50; i++) {
+      const message = queueMessage({})
+      await withQueueMessage(
+        batch(message),
+        message,
+        async () => {
+          getLogger().info({ token: 't' }, 'handled')
+        },
+        { redact: redactKeys(['token']) },
+      )
+      roots.add(envRootLogger(workersEnv, { redact: redactKeys(['token']) }))
+    }
+    expect(roots.size).toBe(1)
+    const handled = linesOf(entries, 'handled')
+    expect(handled).toHaveLength(50)
+    expect(handled.every((e) => e.token === '[REDACTED]')).toBe(true)
+    expect(entries.filter((e) => e.level === 'WARN')).toEqual([])
+  })
+
+  it('withWorkflow: redact from the options; the same options give back the same class', async () => {
+    const entries = _captureEntries()
+    class Flow extends WorkflowEntrypoint {
+      async run() {
+        getLogger().error(errorWithToken(), 'in run')
+      }
+    }
+    const Logged = withWorkflow(Flow, { redact })
+    expect(withWorkflow(Logged, { redact: redactKeys(['token']) })).toBe(Logged)
+    expect(() => withWorkflow(Logged)).toThrow('already wrapped with other options')
+    await (new Logged({} as any, ENV) as unknown as { run(...args: unknown[]): Promise<void> }).run(
+      event(),
+      {} as WorkflowStep,
+    )
+    expect(linesOf(entries, 'in run')[0]!.err).toMatchObject({ token: '[REDACTED]' })
   })
 })

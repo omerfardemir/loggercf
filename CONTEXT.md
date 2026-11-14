@@ -35,10 +35,10 @@ The Root Logger (or a `.child()` of one with per-process fields only) an isolate
 _Avoid_: global logger, fallback logger
 
 **Logger Options**:
-The per-process configuration a Root Logger is built from: service name, minimum level (or `silent`, which writes nothing), environment, version, the Span Defaults, the Error Serializer and the Line Limits.
+The per-process configuration a Root Logger is built from: service name, minimum level (or `silent`, which writes nothing), environment, version, the Span Defaults, the Error Serializer, the Line Limits and the Redactor.
 
 **Env Mapping**:
-Where each Logger Options field is read from in a Worker's (or process's) env: a var name or a function of env. Unmapped fields read `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`, `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES`. The Error Serializer is code, so it has no var: the Workers helpers take it as a `serializeError` option.
+Where each Logger Options field is read from in a Worker's (or process's) env: a var name or a function of env. Unmapped fields read `NAME`, `LOG_LEVEL`, `ENVIRONMENT`, `VERSION`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`, `LOG_MAX_STRING_LENGTH` and `LOG_MAX_RECORD_BYTES`. The Error Serializer and the Redactor are code, so they have no var: the Workers helpers take them as `serializeError` and `redact` options.
 _Avoid_: env config, var map
 
 **Argument Routing**:
@@ -76,6 +76,10 @@ _Avoid_: truncation (only one of the two), size cap
 **Protected Fields**:
 The fields `maxRecordBytes` trims last, after every other value: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, and `err`'s `type` and `message`. When they alone don't fit, `message` and `err.message` are trimmed too. As a last resort the line is `time`, `level`, the trace IDs and `logError`, with `service`, `environment`, `version`, `message` and `err.type` each trimmed to its share of the room left (left out only if even the trimmed one doesn't fit); if `time`, `level` and the trace IDs are over the limit themselves, the trace IDs go, and then `time` and `level` are trimmed. `maxStringLength` never cuts them, except `message` and `err.message`.
 _Avoid_: Record Keys, Moved Keys, Owned Keys (each is another rule)
+
+**Redactor**:
+The `redact` Logger Option, off by default: hides values on a Root Logger's lines. Its `value(value, path)` is called for each value of the finished line (after Argument Routing and Error serialization, so inside every `Error` at any depth), before what is inside it, and returns what to write: the value, or a replacement that is not redacted again. Its `record(record)` gets the whole line once, after. It never sees the top-level `time`, `level` or trace IDs, and it runs before the Line Limits, so they measure what is written. What it returns is serialized like any value. It is user code: a `value()` that throws writes that value as `"[Redaction failed: <name>]"`, a `record()` that throws, or returns anything but a plain object, writes only `time`, `level`, the trace IDs and `redactFailed` (it fails closed), each with one WARN per isolate, and a line logged while it runs keeps only the same. Falsy `redact` is off. `redactKeys(keys)` builds one that replaces the whole value under any of the given keys (a `Map` entry's included), in any case, at any depth, the same object for the same keys; loggercf has no list of its own. Code, so no var turns it on or off: it is chosen per environment in code, and the Workers helpers cache their Root Logger by its identity.
+_Avoid_: scrubber, sanitizer, masking. Not to be confused with the Error Serializer, which shapes Errors (`omitErrorKeys` leaves keys out of them).
 
 **Entrypoint Hook**:
 One of the three getters a `TracedEntrypoint` subclass overrides to supply its Env Mapping, Logger Options or Root Logger, keyed by the symbols `TracedEntrypoint.envMapping`, `.loggerOptions` and `.rootLogger`. Symbol-keyed so they stay off the entrypoint's RPC surface: a caller holding its Service Binding reaches only the string-keyed methods and getters the subclass declares.
