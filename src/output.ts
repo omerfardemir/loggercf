@@ -222,7 +222,7 @@ function isAggregateError(error: Error): error is AggregateError {
   try {
     if (typeof AggregateError === 'function' && error instanceof AggregateError) return true
     // Most Errors stop here, with no `errors` of their own.
-    if (!Object.prototype.hasOwnProperty.call(error, 'errors')) return false
+    if (!Object.hasOwn(error, 'errors')) return false
     let proto: unknown = Object.getPrototypeOf(error)
     for (let i = 0; i < MAX_PROTOTYPE_STEPS && proto !== null && typeof proto === 'object'; i++) {
       const constructor = Object.getOwnPropertyDescriptor(proto, 'constructor')?.value as unknown
@@ -379,8 +379,8 @@ function spend(budget: Budget, cost: Cost): boolean {
  * `cause`, every own property that is an `Error`, and an `AggregateError`'s
  * `errors` (from any realm) have the same shape, nested up to `MAX_CAUSE_DEPTH`
  * levels. An own `toJSON` function is `functionText()`, never copied as a
- * function, which `JSON.stringify` would call. Any
- * other value is kept as it is: the walk of `stringifyRecord()` serializes an
+ * function, which `JSON.stringify` would call. Any other value is kept as it
+ * is: the walk of `stringifyRecord()` serializes an
  * `Error` inside one with this same function, nested in this one. An `Error`
  * nested inside itself (`e.self = e`, a `cause` loop) is `"[Circular]"`
  * there. A property whose getter throws is `unserializable()`. Each `Error`
@@ -457,8 +457,9 @@ export const errorTypeName = (error: Error): unknown =>
 
 /**
  * Write an `Error`'s shape into `out`: `{ type, message, stack, ...own
- * enumerable props, errors?, cause? }`. Never throws: a property whose getter
- * throws is `unserializable()`.
+ * enumerable props, errors?, cause? }`, where an own `toJSON` function is
+ * written as `functionText()`. Never throws: a property whose getter throws is
+ * `unserializable()`.
  *
  * @param {LogRecord} out - The copy. Mutated.
  * @param {Error} error - The `Error`.
@@ -476,7 +477,7 @@ function fillError(out: LogRecord, error: Error, nested: (value: unknown) => unk
   }
   for (const [key, value] of entries) {
     if (key in out || key === 'cause') continue
-    // As a Record Key: a copy with a `toJSON` method would be written by it, so the `Error` could be anything.
+    // Written as text: a copy with a `toJSON` method would be written by it, so the `Error` could be anything.
     out[key] = key === 'toJSON' && typeof value === 'function' ? functionText(value) : nested(value)
   }
   // Not enumerable, so not among the entries.
