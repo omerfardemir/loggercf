@@ -183,7 +183,10 @@ const ENDS_WITH_CUT = /…\[truncated from (\d+) chars\]$/
  * @returns {string} The trimmed string.
  */
 function cutToBytes(text: string, bytes: number): string {
-  const already = ENDS_WITH_CUT.exec(text)
+  const found = ENDS_WITH_CUT.exec(text)
+  // A real earlier cut kept fewer characters than it says the string had; a
+  // string that only ends like a marker is cut as it is.
+  const already = found && Number(found[1]) > found.index ? found : null
   const kept = already ? text.slice(0, already.index) : text
   const marker = cutMarker(already ? Number(already[1]) : text.length)
   let room = bytes - stringBytes(marker)

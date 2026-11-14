@@ -625,6 +625,16 @@ describe('limits.maxRecordBytes', () => {
     }
   })
 
+  it('a string that only ends like a cut marker is cut with its own length', () => {
+    const lines = _captureLines()
+    const text = 'x'.repeat(5000) + '…[truncated from 9 chars]'
+    createLogger({ service: 's', limits: { maxRecordBytes: 1024 } }).info({ a: text }, 'm')
+    expect(bytes(lines[0])).toBeLessThanOrEqual(1024)
+    const cut: string = JSON.parse(lines[0]).a
+    expect(cut.startsWith('xxx')).toBe(true)
+    expect(cut.endsWith(`…[truncated from ${text.length} chars]`)).toBe(true)
+  })
+
   it('works with maxStringLength and omitErrorKeys together', () => {
     const lines = _captureLines()
     const logger = createLogger({
