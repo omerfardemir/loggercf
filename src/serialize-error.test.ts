@@ -25,6 +25,9 @@ class APICallError extends Error {
   }
 }
 
+/** Resolves on the next microtask: an `await` for a serializer to continue after. */
+const nextMicrotask = () => new Promise<void>((resolve) => queueMicrotask(resolve))
+
 /** What `tagging()` writes for an `Error` with this message. */
 const custom = (message: string) => ({ type: 'Error', message, tag: 'custom' })
 
@@ -401,6 +404,63 @@ describe('serializeError in Logger Options', () => {
     }
   })
 
+  it('an async serializer that logs after an await is called once, not again and again', async () => {
+    const entries = _captureEntries()
+    let calls = 0
+    const logger = createLogger({
+      service: 'svc',
+      serializeError: (async (err: Error) => {
+        // Without the guard each call logs, which calls the serializer: stopped here, so a failure ends.
+        if (++calls > 50) return {}
+        await nextMicrotask()
+        logger.warn(err, 'after the await')
+        return {}
+      }) as unknown as ErrorSerializer,
+    })
+    logger.error(new Error('x'), 'first')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(calls).toBe(1)
+    const failed = 'serializeError returned a Promise'
+    expect(entries.map((e) => e.message)).toEqual(['first', 'after the await'])
+    expect(entries[0].err).toMatchObject({ message: 'x', serializeErrorFailed: failed })
+    // The line logged from the body is written in the default shape, not by the serializer.
+    expect(entries[1].err).toMatchObject({
+      type: 'Error',
+      message: 'x',
+      stack: expect.any(String),
+      serializeErrorFailed: failed,
+    })
+  })
+
+  it('a serializer that returned a thenable is not called again, on any later line or depth', () => {
+    const entries = _captureEntries()
+    let calls = 0
+    const serializeError = (() => {
+      calls++
+      // oxlint-disable-next-line unicorn/no-thenable
+      return { then: () => 1 }
+    }) as unknown as ErrorSerializer
+    const logger = createLogger({ service: 'svc', serializeError })
+    logger.error(new Error('a'))
+    logger.error(new Error('b'), 'm', { deep: { er: new Error('c') } })
+    expect(calls).toBe(1)
+    const failed = 'serializeError returned a thenable'
+    expect(entries[0].err).toMatchObject({ message: 'a', serializeErrorFailed: failed })
+    expect(entries[1].err).toMatchObject({ message: 'b', serializeErrorFailed: failed })
+    expect(entries[1].deep).toMatchObject({ er: { message: 'c', serializeErrorFailed: failed } })
+  })
+
+  it('only the serializer that returned a thenable is skipped', async () => {
+    const entries = _captureEntries()
+    const asyncOne = (async () => ({})) as unknown as ErrorSerializer
+    const syncOne = tagging().serializer
+    createLogger({ service: 'a', serializeError: asyncOne }).error(new Error('x'))
+    createLogger({ service: 'b', serializeError: syncOne }).error(new Error('y'))
+    createLogger({ service: 'a', serializeError: asyncOne }).error(new Error('z'))
+    expect(entries[1].err).toEqual(custom('y'))
+    expect(entries[2].err).toMatchObject({ message: 'z', serializeErrorFailed: expect.any(String) })
+  })
+
   it('a non-function serializeError throws at createLogger', () => {
     expect(() => createLogger({ service: 'svc', serializeError: 'no' as never })).toThrow(
       'serializeError must be a function',
@@ -417,6 +477,128 @@ describe('serializeError in Logger Options', () => {
       responseBody: 'x'.repeat(50),
     })
     expect(entries[0].err).not.toHaveProperty('omitted')
+  })
+})
+
+/** An `Error` whose class has its own `toJSON`, which writes what the serializer leaves out. */
+class ToJSONError extends Error {
+  body = 'user secret body'
+  toJSON() {
+    return { toJSON: true, message: this.message, body: this.body }
+  }
+}
+
+/** An `Error` whose class `toJSON` returns a string, which holds what the serializer leaves out. */
+class TextToJSONError extends Error {
+  body = 'user secret body'
+  toJSON() {
+    return `tj:${this.body}`
+  }
+}
+
+describe('an Error with a class toJSON, at any depth', () => {
+  beforeEach(() => _reset())
+
+  it('is written by serializeError at depth 0, 1, 2 and 3', () => {
+    const entries = _captureEntries()
+    const { serializer } = tagging()
+    createLogger({ service: 'svc', serializeError: serializer }).error(
+      new ToJSONError('top'),
+      'm',
+      {
+        d1: new ToJSONError('one'),
+        a: { d2: new ToJSONError('two') },
+        b: { c: [new ToJSONError('three')] },
+      },
+    )
+    expect(entries[0]).toMatchObject({
+      err: custom('top'),
+      d1: custom('one'),
+      a: { d2: custom('two') },
+      b: { c: [custom('three')] },
+    })
+    expect(JSON.stringify(entries[0])).not.toContain('toJSON')
+  })
+
+  it('is written by serializeError on a line the walk writes (a repeat sends it there)', () => {
+    const entries = _captureEntries()
+    const { serializer } = tagging()
+    const shared = { n: 1 }
+    createLogger({ service: 'svc', serializeError: serializer }).info('m', {
+      one: shared,
+      two: shared,
+      a: { b: new ToJSONError('deep') },
+    })
+    expect(entries[0]).toMatchObject({ a: { b: custom('deep') } })
+    expect(JSON.stringify(entries[0])).not.toContain('user secret body')
+  })
+
+  it('omitErrorKeys(["body"]) drops body from it at depth 2', () => {
+    const entries = _captureEntries()
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['body']) }).info('m', {
+      a: { b: new ToJSONError('deep') },
+    })
+    expect(entries[0].a).toEqual({
+      b: { type: 'ToJSONError', message: 'deep', stack: expect.any(String), omitted: ['body'] },
+    })
+    expect(JSON.stringify(entries[0])).not.toContain('user secret body')
+  })
+
+  it('omitErrorKeys(["body"]) drops body when its toJSON returns a string, at depth 2', () => {
+    const entries = _captureEntries()
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['body']) }).info('m', {
+      a: { b: new TextToJSONError('deep') },
+      c: {
+        get d() {
+          return new TextToJSONError('got')
+        },
+      },
+    })
+    expect(entries[0].a).toEqual({
+      b: { type: 'TextToJSONError', message: 'deep', stack: expect.any(String), omitted: ['body'] },
+    })
+    expect(entries[0].c).toMatchObject({ d: { message: 'got', omitted: ['body'] } })
+    expect(JSON.stringify(entries[0])).not.toContain('user secret body')
+  })
+
+  it('%j and %o do not print it: it is routed and written by the serializer', () => {
+    const entries = _captureEntries()
+    const logger = createLogger({ service: 'svc', serializeError: omitErrorKeys(['body']) })
+    logger.info('v=%j', { a: { b: new ToJSONError('deep') } })
+    logger.info('v=%o', new TextToJSONError('top'))
+    expect(entries[0].message).toBe('v=%j')
+    expect(entries[1].message).toBe('v=%o')
+    expect(JSON.stringify(entries)).toContain('"omitted":["body"]')
+    expect(JSON.stringify(entries)).not.toContain('user secret body')
+  })
+
+  it('is the minimal shape on a line logged from inside the serializer, at depth 2', () => {
+    const entries = _captureEntries()
+    const other = createLogger({ service: 'other' }) // a logger without serializeError
+    const error = new ToJSONError('inner')
+    const user: ErrorSerializer = (err, defaultSerialize) => {
+      other.warn('through another logger', { a: { b: error } })
+      return defaultSerialize(err)
+    }
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['body'], user) }).error(
+      new Error('outer'),
+    )
+    expect(entries[0].a).toEqual({
+      b: {
+        type: 'ToJSONError',
+        message: 'inner',
+        serializeErrorFailed: 'logged from inside serializeError',
+      },
+    })
+    expect(JSON.stringify(entries)).not.toContain('user secret body')
+  })
+
+  it('without serializeError, its toJSON still writes it, as JSON does', () => {
+    const entries = _captureEntries()
+    createLogger({ service: 'svc' }).info('m', { a: { b: new ToJSONError('deep') } })
+    expect(entries[0].a).toEqual({
+      b: { toJSON: true, message: 'deep', body: 'user secret body' },
+    })
   })
 })
 
@@ -586,6 +768,29 @@ describe('omitErrorKeys', () => {
       expect(JSON.stringify(entries[0])).not.toContain('user secret prompt')
     },
   )
+
+  it('a wrapped async serializer that logs after an await is called once', async () => {
+    const entries = _captureEntries()
+    let calls = 0
+    const logger = createLogger({
+      service: 'svc',
+      serializeError: omitErrorKeys(['requestBodyValues'], (async (err: Error) => {
+        if (++calls > 50) return {}
+        await nextMicrotask()
+        logger.warn(err, 'after the await')
+        return {}
+      }) as unknown as ErrorSerializer),
+    })
+    logger.error(new APICallError())
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(calls).toBe(1)
+    expect(entries).toHaveLength(2)
+    expect(entries[1].err).toMatchObject({
+      omitted: ['requestBodyValues'],
+      serializeErrorFailed: 'serializeError returned a Promise',
+    })
+    expect(JSON.stringify(entries)).not.toContain('user secret prompt')
+  })
 
   it('without a serializer, the same keys give the same function, in any order and with repeats', () => {
     const serializeError = omitErrorKeys(['requestBodyValues', 'responseBody'])
