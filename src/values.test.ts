@@ -768,7 +768,7 @@ describe('an Error is serialized once per line', () => {
     })
   })
 
-  it('a reused copy never writes an Error inside itself (#43)', () => {
+  it('a reused copy never writes an Error inside itself', () => {
     const entries = _captureEntries()
     const logger = createLogger({ service: 'svc' })
     const viaObjects = nestedInItself((e) => ({ e }))
