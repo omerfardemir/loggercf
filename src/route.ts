@@ -105,7 +105,7 @@ function render(code: string, value: unknown, printer: MessagePrinter): string |
     case 'i':
     case 'f': {
       if (code !== 'f' && typeof value === 'bigint') {
-        const digits = String(value)
+        const digits = printer.digits(value)
         return printer.admit(digits) ? digits : UNRENDERED
       }
       const number = numberFor(value)
@@ -127,7 +127,7 @@ function render(code: string, value: unknown, printer: MessagePrinter): string |
       if (isError(value)) text = errorMessage(value)
       else if (value instanceof Date) text = dateText(value)
       else if (typeof value === 'object' && value !== null) return UNRENDERED
-      else text = String(value)
+      else text = typeof value === 'bigint' ? printer.digits(value) : String(value)
       return printer.admit(text) ? text : UNRENDERED
     }
     default:
@@ -299,7 +299,7 @@ export function routeArgs(input: readonly unknown[], budget: Budget = newBudget(
       template = remaining.shift() as string
     } else if (isPrimitive(first)) {
       overflow.push(first)
-      message = String(first)
+      message = typeof first === 'bigint' ? printer.digits(first) : String(first)
       printer.admit(message) // as for a leading `Error`
     } else {
       overflow.push(first)
@@ -324,7 +324,7 @@ export function routeArgs(input: readonly unknown[], budget: Budget = newBudget(
       } else if (isPlainObject(value)) {
         merge(value)
       } else if (isPrimitive(value)) {
-        const word = String(value)
+        const word = typeof value === 'bigint' ? printer.digits(value) : String(value)
         if (printer.admit(word)) words.push(word)
         else overflow.push(value) // a long repeat over the budget: `"[Repeated]"` in `args`
       } else {

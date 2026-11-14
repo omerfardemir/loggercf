@@ -650,3 +650,117 @@ describe('levels and child loggers', () => {
     expect(entries[2]).toMatchObject({ a: 'child', b: 1, c: 2 })
   })
 })
+
+/** A `BigInt` of `digits` digits. */
+const bigint = (digits: number) => 10n ** BigInt(digits - 1)
+
+/** The fastest of a few runs: one slow run on a busy machine does not count. */
+const fastest = (fn: () => void) => Math.min(...Array.from({ length: 3 }, () => elapsed(fn)))
+
+describe('a long BigInt is converted to text once per line', () => {
+  beforeEach(() => _reset())
+
+  it('100 copies of a 200,000-digit BigInt, as words: fast, and the line stays bounded', () => {
+    const lines = _captureLines()
+    const big = bigint(200_000)
+    const ms = elapsed(() => createLogger({ service: 'svc' }).info('m', ...Array(100).fill(big)))
+    expect(ms).toBeLessThan(250) // 0.85 s when each copy is converted again
+    expect(lines[0].length).toBeLessThan(1_000_000)
+  })
+
+  it('100 copies of a 200,000-digit BigInt, under %d: fast, and the line stays bounded', () => {
+    const lines = _captureLines()
+    const big = bigint(200_000)
+    const ms = elapsed(() =>
+      createLogger({ service: 'svc' }).info('%d'.repeat(100), ...Array(100).fill(big)),
+    )
+    expect(ms).toBeLessThan(250) // 1.67 s when each copy is converted again
+    expect(lines[0].length).toBeLessThan(1_000_000)
+  })
+
+  it('two references to one 500,000-digit BigInt cost one conversion, not three', () => {
+    _captureLines()
+    const log = createLogger({ service: 'svc' })
+    const big = bigint(500_000)
+    const once = fastest(() => log.info({ a: big }))
+    const twice = fastest(() => log.info({ a: big, b: big }))
+    expect(twice).toBeLessThan(once * 2)
+  })
+
+  it('a BigInt in the message and in a field cost one conversion between them', () => {
+    _captureLines()
+    const log = createLogger({ service: 'svc' })
+    const big = bigint(500_000)
+    const once = fastest(() => log.info({ a: big }))
+    const both = fastest(() => log.info({ a: big }, '%d', big))
+    expect(both).toBeLessThan(once * 2)
+  })
+
+  it('writes the same text as before', () => {
+    const lines = _captureLines()
+    const big = bigint(2000)
+    createLogger({ service: 'svc' }).info({ a: big, b: big }, '%d %i', big, big)
+    const line = JSON.parse(lines[0]) as Record<string, unknown>
+    expect(line.message).toBe(`${big} ${big}`)
+    expect(line.a).toBe(String(big))
+    expect(line.b).toBe(String(big))
+  })
+})
+
+describe('a boxed string counts toward the fast path caps and the repeat rules', () => {
+  beforeEach(() => _reset())
+
+  it('400 wrappers of one 1 MiB string: the line stays under 2 MiB', () => {
+    const lines = _captureLines()
+    const text = 'x'.repeat(2 ** 20)
+    const ms = elapsed(() =>
+      createLogger({ service: 'svc' }).info({
+        a: Array.from({ length: 400 }, () => new String(text)),
+      }),
+    )
+    expect(lines[0].length).toBeLessThan(2 * 2 ** 20) // 400 MB when each is written in full
+    expect(ms).toBeLessThan(500)
+    const written = JSON.parse(lines[0]).a as string[]
+    expect(written).toHaveLength(400)
+    expect(written[0]).toBe(text)
+    expect(written.at(-1)).toBe('[Repeated]')
+  })
+
+  it('a subclass of String is a wrapper too', () => {
+    class Name extends String {}
+    const lines = _captureLines()
+    const text = 'x'.repeat(2 ** 20)
+    createLogger({ service: 'svc' }).info({
+      a: Array.from({ length: 400 }, () => new Name(text)),
+    })
+    expect(lines[0].length).toBeLessThan(2 * 2 ** 20)
+  })
+
+  it('maxStringLength cuts a wrapped string like any other', () => {
+    const lines = _captureLines()
+    createLogger({ service: 'svc', limits: { maxStringLength: 10 } }).info({
+      s: new String('x'.repeat(50)),
+    })
+    expect(JSON.parse(lines[0]).s).toBe('xxxxxxxxxx…[truncated from 50 chars]')
+  })
+
+  it('writes boxed primitives as JSON does', () => {
+    const lines = _captureLines()
+    createLogger({ service: 'svc' }).info({
+      s: new String('hi'),
+      n: new Number(1.5),
+      nan: new Number(NaN),
+      t: new Boolean(false),
+      big: Object(12n),
+      sym: Object(Symbol('q')),
+    })
+    expect(JSON.parse(lines[0])).toMatchObject({
+      s: 'hi',
+      n: 1.5,
+      nan: null,
+      t: false,
+      big: '12',
+      sym: 'Symbol(q)',
+    })
+  })
+})
