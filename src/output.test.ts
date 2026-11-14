@@ -855,6 +855,22 @@ describe('a boxed string counts toward the fast path caps and the repeat rules',
     expect(lines[0].length).toBeLessThan(2 * 2 ** 20)
   })
 
+  it('a wrapper from another realm, or with a null prototype, is a wrapper too', () => {
+    const lines = _captureLines()
+    const text = 'x'.repeat(2 ** 20)
+    const foreign = vm.runInNewContext('(text) => new String(text)') as (t: string) => object
+    const orphan = () => Object.setPrototypeOf(new String(text), null) as object
+    const logger = createLogger({ service: 'svc' })
+    logger.info({ a: Array.from({ length: 400 }, () => foreign(text)) })
+    logger.info({ a: Array.from({ length: 400 }, orphan) })
+    for (const line of lines) {
+      expect(line.length).toBeLessThan(2 * 2 ** 20) // 400 MB, or 13 times that as index keys
+      const written = JSON.parse(line).a as string[]
+      expect(written[0]).toBe(text)
+      expect(written.at(-1)).toBe('[Repeated]')
+    }
+  })
+
   it('maxStringLength cuts a wrapped string like any other', () => {
     const lines = _captureLines()
     createLogger({ service: 'svc', limits: { maxStringLength: 10 } }).info({

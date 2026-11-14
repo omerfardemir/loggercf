@@ -1288,44 +1288,64 @@ const BOXES: readonly [object, (this: unknown) => unknown][] = [
 ]
 
 /**
+ * The `valueOf` of each primitive in `BOXES`, by the tag
+ * `Object.prototype.toString` gives a boxed one from any realm.
+ */
+const BOX_TAGS = new Map<string, (this: unknown) => unknown>([
+  ['[object Number]', Number.prototype.valueOf],
+  ['[object String]', String.prototype.valueOf],
+  ['[object Boolean]', Boolean.prototype.valueOf],
+  ['[object BigInt]', BigInt.prototype.valueOf],
+  ['[object Symbol]', Symbol.prototype.valueOf],
+])
+
+/**
  * The primitive inside a boxed primitive (`new Number(1)`, `Object(1n)`),
- * told by its brand, as `JSON.stringify` tells it. Only an object that
- * inherits from that primitive's prototype is checked, since a failed check
- * throws, which is slow; a boxed primitive moved to another prototype
- * (`Object.setPrototypeOf`) is written as an object here. The fast path of
- * `stringifyRecord()` hands every object that inherits from one of these
- * prototypes to this walk (see `isBoxed()`), so a boxed string counts toward
- * its caps and the repeat rules.
+ * told by its brand, as `JSON.stringify` tells it. An object of this realm
+ * is checked only when it inherits from that primitive's prototype, since a
+ * failed check throws, which is slow; a boxed primitive moved to another
+ * prototype (`Object.setPrototypeOf(box, {})`) is written as an object here.
+ * One from another realm (a `vm` context) or with a `null` prototype inherits
+ * none of them: its tag picks the one to check, as it is rare. The fast path
+ * of `stringifyRecord()` hands every boxed primitive to this walk (see
+ * `isBoxed()`), so a boxed string counts toward the Re-write Budget and the
+ * repeat rules, and `maxStringLength` cuts it.
  *
  * @param {object} object - Any object that is not a plain object or an array.
  * @returns {{ value: unknown } | undefined} The primitive, or `undefined` when `object` is not boxed.
  * @throws When its prototype cannot be read (a `Proxy` whose `getPrototypeOf` throws).
  */
 function unbox(object: object): { value: unknown } | undefined {
+  let found: ((this: unknown) => unknown) | undefined
   for (const [prototype, valueOf] of BOXES) {
-    if (!Object.prototype.isPrototypeOf.call(prototype, object)) continue
-    try {
-      return { value: valueOf.call(object) }
-    } catch {
-      return undefined // a fake: `Object.create(Number.prototype)`
+    if (Object.prototype.isPrototypeOf.call(prototype, object)) {
+      found = valueOf
+      break
     }
   }
-  return undefined
+  if (!found && !Object.prototype.isPrototypeOf.call(Object.prototype, object)) {
+    try {
+      found = BOX_TAGS.get(Object.prototype.toString.call(object))
+    } catch {
+      return undefined // a tag that throws: not a boxed primitive this walk can tell
+    }
+  }
+  if (!found) return undefined
+  try {
+    return { value: found.call(object) }
+  } catch {
+    return undefined // a fake: `Object.create(Number.prototype)`
+  }
 }
 
 /**
- * Whether `object` inherits from the prototype of a boxed primitive
- * (`BOXES`), as `unbox()` tells. A fake (`Object.create(Number.prototype)`)
- * counts too: the walk then writes it as an object.
+ * Whether `object` is a boxed primitive, as `unbox()` tells it.
  *
  * @param {object} object - Any object that is not a plain object or an array.
- * @returns {boolean} `true` when it may be a boxed primitive.
+ * @returns {boolean} `true` when it is one.
+ * @throws When its prototype cannot be read (a `Proxy` whose `getPrototypeOf` throws).
  */
-function isBoxed(object: object): boolean {
-  for (const [prototype] of BOXES)
-    if (Object.prototype.isPrototypeOf.call(prototype, object)) return true
-  return false
-}
+const isBoxed = (object: object): boolean => unbox(object) !== undefined
 
 /**
  * The object part of `toJSONValue()`: its items or entries, each converted.
@@ -1343,7 +1363,8 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     if (object instanceof Map) items = Array.from(object)
     else if (object instanceof Set) items = Array.from(object)
     else if (Array.isArray(object)) items = object
-    else if (!isPlainObject(object)) boxed = unbox(object) // `new Number(1)`, as JSON writes it
+    // `new Number(1)`, as JSON writes it; a `null` prototype may hold a boxed one too.
+    else if (Object.getPrototypeOf(object) !== Object.prototype) boxed = unbox(object)
     if (!items && !boxed) keys = Object.keys(object)
     length = items?.length ?? 0
   } catch (thrown) {
@@ -1481,7 +1502,7 @@ export function stringifyRecord(record: LogRecord): string {
  */
 function writeRecord(record: LogRecord, options: LineOptions | undefined): string {
   const maxString = options?.maxStringLength ?? Infinity
-  let texts: Map<unknown, string> | undefined // read from the record at the first BigInt
+  let texts: Map<unknown, string> | undefined // the record's, read at each BigInt until one is found
   if (typeof record.toJSON !== 'function') {
     const seen = new WeakSet<object>()
     let strings: Set<string> | undefined
