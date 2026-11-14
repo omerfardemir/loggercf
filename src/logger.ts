@@ -146,6 +146,19 @@ function checkLineOptions(options: LoggerOptions): LineOptions | undefined {
   return Object.keys(line).length > 0 ? line : undefined
 }
 
+/** How many characters of a path key the WARN for a failed `value()` writes. */
+const MAX_PATH_KEY = 64
+
+/**
+ * A path key as the WARN writes it: cut to `MAX_PATH_KEY` characters, so an
+ * object keyed by tokens can't put them in the WARN.
+ *
+ * @param {string} key - The path key.
+ * @returns {string} `key`, or its first characters and `…`.
+ */
+const shortKey = (key: string): string =>
+  key.length > MAX_PATH_KEY ? `${key.slice(0, MAX_PATH_KEY)}…` : key
+
 /** Whether the WARN for a redactor hook that failed has been written in this isolate. */
 let warnedRedactFailure = false
 
@@ -159,8 +172,8 @@ let warnedRedactFailure = false
  */
 function lineRedactor(options: LoggerOptions): LineRedactor | undefined {
   const { redact } = options
-  if (redact === undefined || redact === false) return undefined
-  if (typeof redact !== 'object' || redact === null)
+  if (!redact) return undefined // `false`, and any other falsy value, is off
+  if (typeof redact !== 'object')
     throw new TypeError('redact must be a Redactor ({ value?, record? }) or false')
   const { value, record } = redact
   if (value !== undefined && typeof value !== 'function')
@@ -181,10 +194,10 @@ function lineRedactor(options: LoggerOptions): LineRedactor | undefined {
       warning.message =
         hook === 'value'
           ? 'redact value() failed; the value is written as "[Redaction failed: <name>]"'
-          : 'redact record() failed; the line is written as value() left it, with redactFailed'
+          : 'redact record() failed; the line is written as only time, level, the trace IDs and redactFailed'
       warning.redactHook = hook
       warning.redactError = reason
-      if (path) warning.redactPath = [...path]
+      if (path) warning.redactPath = path.map(shortKey)
       const trace = als.getStore()?.trace
       if (trace) applyTrace(warning, trace)
       try {

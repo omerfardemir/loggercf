@@ -560,11 +560,11 @@ export default class extends TracedEntrypoint {
 }
 ```
 
-- `redactKeys(keys, { censor? })` replaces the whole value under a matching key with `'[REDACTED]'` (or `censor`), whatever its case, at any depth: fields, Context Fields, bindings, `args`, and inside every `Error` (`err`, `errors`, `cause`, nested ones). Only whole keys match: `password` doesn't hide `passwordHint`.
-- It matches keys, never text. Log objects that may hold secrets as fields (`logger.info({ body }, 'm')`), never through `%j` / `%o`, which prints them into `message` as text. A `Map`'s keys are not matched.
+- `redactKeys(keys, { censor? })` replaces the whole value under a matching key with `'[REDACTED]'` (or `censor`), whatever its case (a simple Unicode case fold), at any depth: fields, Context Fields, bindings, `args`, and inside every `Error` (`err`, `errors`, `cause`, nested ones). Only whole keys match: `password` doesn't hide `passwordHint`.
+- It matches keys, never text. Log objects that may hold secrets as fields (`logger.info({ body }, 'm')`), never through `%j` / `%o`, which prints them into `message` as text.
 - It runs on every line the logger writes, after `Error` serialization and before `limits`: `request.end`, `span.end`, `<operation> failed` included. It never sees the top-level `time`, `level` or trace IDs.
 - A custom redactor is a `Redactor`: `{ value?(value, path), record?(record) }`. `value` is called for each value before what is inside it, with its path (`['err', 'cause', 'message']`, `['args', '0', 'token']`); return it, or a replacement, which is written as it is. `record` gets the whole line once, as JSON data. Never change a value in place in `value`. What either returns goes through the usual serializer rules.
-- A hook that throws never breaks the log call: the value is `"[Redaction failed: <name>]"`, or the line gets `redactFailed`, with one `WARN` per isolate. A line logged from inside a hook keeps only `time`, `level`, the trace IDs and `redactFailed`.
+- A hook that throws never breaks the log call: the value is `"[Redaction failed: <name>]"`, or (for `record()`) the line is only `time`, `level`, the trace IDs and `redactFailed`, with one `WARN` per isolate. A line logged from inside a hook keeps only `time`, `level`, the trace IDs and `redactFailed`.
 - The Workers helpers take `redact` as an option next to `serializeError` (`defaultLoggerFromEnv(mapping, { redact })`), and a `TracedEntrypoint` sets it in its `[TracedEntrypoint.loggerOptions]` getter. The helpers cache their Root Logger by the `redact` object: `redactKeys([...])` gives the same one for the same keys, even inline, but a `Redactor` object literal written in a hook or in the call is a new Root Logger each time.
 
 ```ts wrong

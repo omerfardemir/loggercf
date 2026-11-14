@@ -33,6 +33,14 @@ function recorder(): { redact: Redactor; paths: string[] } {
   }
 }
 
+/** A `Proxy` trap that throws a message holding user data. */
+const trap = () => {
+  throw new Error('trap secret')
+}
+
+/** Masks card numbers in text. */
+const mask = (text: unknown) => String(text).replace(/\d{4}-\d{4}/g, '****')
+
 /** A named function, as a value. */
 function named(): void {}
 
@@ -74,6 +82,12 @@ describe('redact off', () => {
     expect(omitted.join('\n')).toContain('"password":"p"')
   })
 
+  it('any falsy redact is off, without throwing', () => {
+    const omitted = writeAll({})
+    for (const redact of [false, '', null, undefined, 0])
+      expect(writeAll({ redact: redact as never })).toEqual(omitted)
+  })
+
   it('there is no default key list: without redact, nothing is hidden', () => {
     const entries = _captureEntries()
     createLogger({ service: 'svc' }).info({
@@ -88,7 +102,7 @@ describe('redact off', () => {
   })
 
   it('an invalid redact throws when the logger is built', () => {
-    for (const redact of [true, 'keys', 1, null, () => 0])
+    for (const redact of [true, 'keys', 1, () => 0])
       expect(() => createLogger({ service: 's', redact: redact as never })).toThrow(
         'redact must be a Redactor',
       )
@@ -213,7 +227,7 @@ describe('what value() is given', () => {
     expect('loop.self' in byPath).toBe(false)
     expect(byPath.map).toBeInstanceOf(Map)
     expect(given.map(([path]) => path)).toEqual(
-      expect.arrayContaining(['map.0', 'map.0.0', 'map.0.1']),
+      expect.arrayContaining(['map.0', 'map.0.0', 'map.0.authorization']),
     )
     expect(byPath['nested.e']).toMatchObject({ type: 'TypeError', message: 'deep' })
     expect(byPath['nested.e.message']).toBe('deep')
@@ -309,15 +323,91 @@ describe('redactKeys', () => {
     })
   })
 
-  it('takes a censor, and does not look inside text or a Map', () => {
+  it('takes a censor, and does not look inside text', () => {
     const entries = _captureEntries()
     createLogger({ service: 's', redact: redactKeys(['password'], { censor: '***' }) }).info(
-      { password: 'p', map: new Map([['password', 'in a map']]) },
+      { password: 'p' },
       'body %j',
       { password: 'in the message' },
     )
-    expect(entries[0]).toMatchObject({ password: '***', map: [['password', 'in a map']] })
+    expect(entries[0]).toMatchObject({ password: '***' })
     expect(entries[0]!.message).toContain('in the message')
+  })
+
+  it('censors the value of a Map entry whose string key matches, and passes the key as the path key', () => {
+    const entries = _captureEntries()
+    const paths: string[] = []
+    const keys = redactKeys(['password'])
+    const logger = createLogger({
+      service: 's',
+      redact: {
+        value(value, path) {
+          if (path[0] === 'map') paths.push(path.join('.'))
+          return keys.value!(value, path)
+        },
+      },
+    })
+    logger.info({
+      map: new Map<unknown, unknown>([
+        ['Password', 'a'],
+        ['other', { password: 'b', ok: 1 }],
+        [1, 'c'],
+      ]),
+    })
+    expect(entries[0]!.map).toEqual([
+      ['Password', '[REDACTED]'],
+      ['other', { password: '[REDACTED]', ok: 1 }],
+      [1, 'c'],
+    ])
+    expect(paths).toEqual(
+      expect.arrayContaining(['map.0.0', 'map.0.Password', 'map.1.other', 'map.1.other.password']),
+    )
+    expect(paths).toContain('map.2.1') // a key that is not a string: the index
+  })
+
+  it('compares keys Unicode-normalized, with a simple case fold', () => {
+    const entries = _captureEntries()
+    const logger = createLogger({
+      service: 's',
+      redact: redactKeys(['café', 'Straße']),
+    })
+    logger.info({
+      café: 1, // "e" and a combining accent: the same key as "é"
+      CAFÉ: 2,
+      STRAẞE: 3, // a capital sharp s folds to "ß"
+      strasse: 4, // but "ß" is not "ss"
+      cafe: 5,
+    })
+    expect(entries[0]).toMatchObject({
+      café: '[REDACTED]',
+      CAFÉ: '[REDACTED]',
+      STRAẞE: '[REDACTED]',
+      strasse: 4,
+      cafe: 5,
+    })
+    expect(redactKeys(['café'])).toBe(redactKeys(['café']))
+  })
+
+  it('does not remember a long key, and still matches it; a short key is remembered', () => {
+    const entries = _captureEntries()
+    const longKey = 't'.repeat(100)
+    const logger = createLogger({ service: 's', redact: redactKeys(['password', 'T'.repeat(100)]) })
+    logger.info({ Password: 0 }) // warm-up: `service` and `Password` are remembered
+    const spy = vi.spyOn(String.prototype, 'normalize')
+    try {
+      logger.info({ Password: 1 })
+      expect(spy).not.toHaveBeenCalled() // remembered
+      logger.info({ [longKey]: 1 })
+      logger.info({ [longKey]: 2 })
+      expect(spy).toHaveBeenCalledTimes(2) // folded again on the second line
+    } finally {
+      spy.mockRestore()
+    }
+    expect(entries.slice(1).map((e) => e.Password ?? e[longKey])).toEqual([
+      '[REDACTED]',
+      '[REDACTED]',
+      '[REDACTED]',
+    ])
   })
 
   it('the same keys, in any case or order, give the same Redactor; other keys or censor do not', () => {
@@ -397,52 +487,117 @@ describe('a redactor that fails', () => {
     expect(unhandled).not.toHaveBeenCalled()
   })
 
-  it('record() that throws: the line as value() left it, with redactFailed', () => {
+  it('record() that throws fails closed: no field is written, only time, level, the trace IDs and redactFailed', () => {
     const entries = _captureEntries()
     const redact: Redactor = {
       ...redactKeys(['password']),
-      record() {
+      record(record) {
+        record.message = 'changed in place before it threw'
         throw new Error('record broke with the secret in it')
       },
     }
-    const logger = createLogger({ service: 's', redact })
-    logger.info({ password: 'p', ok: 1 }, 'one')
-    logger.info({ password: 'p' }, 'two')
+    const logger = createLogger({ service: 's', environment: 'e', redact })
+    runWithLogger({ logger, traceparent: TRACEPARENT, fields: { requestId: 'r' } }, () => {
+      logger.info({ password: 'p', ok: 1, token: 'secret-token' }, 'one')
+      logger.info({ password: 'p' }, 'two')
+    })
     const lines = entries.filter((e) => e.level === 'INFO')
     expect(lines[0]).toEqual({
       time: expect.any(String),
       level: 'INFO',
-      message: 'one',
-      service: 's',
-      password: '[REDACTED]',
-      ok: 1,
       redactFailed: 'record() threw Error',
+      traceId: '0af7651916cd43dd8448eb211c80319c',
+      spanId: expect.any(String),
+      parentSpanId: 'b7ad6b7169203331',
     })
     expect(lines[1]!.redactFailed).toBe('record() threw Error')
     const warnings = entries.filter((e) => e.level === 'WARN')
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatchObject({ redactHook: 'record', redactError: 'record() threw Error' })
-    expect(JSON.stringify(entries)).not.toContain('secret')
+    expect(JSON.stringify(entries)).not.toMatch(/secret|"ok"|changed in place/)
   })
 
-  it('record() that returns anything but a plain object', () => {
+  it('record() that returns anything but a plain object fails closed', () => {
     for (const [result, failure] of [
       [undefined, 'record() returned undefined'],
       [null, 'record() returned null'],
       [[1], 'record() returned an array'],
       [Promise.resolve({}), 'record() returned a Promise'],
-      [new Map(), 'record() returned an object that is not plain'],
+      [new Map([['secret', 'v']]), 'record() returned an object that is not plain'],
+      [new (class Line {})(), 'record() returned an object that is not plain'],
       ['line', 'record() returned a string'],
     ] as const) {
       _reset()
       const entries = _captureEntries()
-      createLogger({ service: 's', redact: { record: () => result as never } }).info({ a: 1 }, 'm')
-      expect(entries.find((e) => e.level === 'INFO')).toMatchObject({
-        a: 1,
-        message: 'm',
+      createLogger({ service: 's', redact: { record: () => result as never } }).info(
+        { a: 'secret-a' },
+        'm',
+      )
+      expect(entries.find((e) => e.level === 'INFO')).toEqual({
+        time: expect.any(String),
+        level: 'INFO',
         redactFailed: failure,
       })
     }
+  })
+
+  it('record() that returns a Proxy whose traps throw fails closed', () => {
+    const entries = _captureEntries()
+    const hostile = new Proxy({}, { get: trap, ownKeys: trap, getPrototypeOf: trap, has: trap })
+    createLogger({ service: 's', redact: { record: () => hostile as never } }).info(
+      { a: 'secret-a' },
+      'm',
+    )
+    const line = entries.find((e) => e.level === 'INFO')!
+    expect(Object.keys(line)).toEqual(['time', 'level', 'redactFailed'])
+    expect(JSON.stringify(entries)).not.toContain('secret')
+  })
+
+  it('a hook error name is written only when it is an identifier of up to 64 characters', () => {
+    for (const [name, written] of [
+      ['TypeError', 'TypeError'],
+      ['$Odd_name1', '$Odd_name1'],
+      ['x'.repeat(64), 'x'.repeat(64)],
+      ['x'.repeat(65), 'Error'],
+      ['Bearer abc.def', 'Error'],
+      ['1abc', 'Error'],
+      ['', 'Error'],
+      [42, 'Error'],
+    ] as const) {
+      _reset()
+      const entries = _captureEntries()
+      const thrown = Object.assign(new Error('m'), { name })
+      createLogger({
+        service: 's',
+        redact: {
+          value: (value, path) => {
+            if (path.at(-1) === 'x') throw thrown
+            return value
+          },
+          record: () => {
+            throw thrown
+          },
+        },
+      }).info({ x: 1 }, 'm')
+      const line = entries.find((e) => e.level === 'INFO')!
+      expect(line.redactFailed).toBe(`record() threw ${written}`)
+      expect(entries.find((e) => e.level === 'WARN')!.redactError).toBe(written)
+    }
+  })
+
+  it('the WARN cuts each path key to 64 characters', () => {
+    const entries = _captureEntries()
+    const token = 'tok'.repeat(40)
+    const redact: Redactor = {
+      value(value, path) {
+        if (path.at(-1) === 'bad') throw new Error('x')
+        return value
+      },
+    }
+    createLogger({ service: 's', redact }).info({ [token]: { bad: 1 } })
+    const warning = entries.find((e) => e.level === 'WARN')!
+    expect(warning.redactPath).toEqual([`${token.slice(0, 64)}\u2026`, 'bad'])
+    expect(JSON.stringify(warning)).not.toContain(token)
   })
 
   it('never throws from a log call, nor loses the line, whatever the hooks throw', () => {
@@ -605,6 +760,63 @@ describe('what record() is given and returns', () => {
     })
     // The shared object repeats within the Re-write Budget, then is "[Repeated]".
     expect((line.many as unknown[]).at(-1)).toBe('[Repeated]')
+  })
+
+  it('is given ordinary objects: hasOwnProperty works, and masks the message', () => {
+    const entries = _captureEntries()
+    createLogger({
+      service: 's',
+      redact: {
+        record(r) {
+          if (r.hasOwnProperty('message')) r.message = mask(r.message)
+          return r
+        },
+      },
+    }).info({ card: '1234-5678' }, 'paid with 1234-5678')
+    expect(entries[0]).toMatchObject({ message: 'paid with ****', card: '1234-5678' })
+    expect(entries[0]!.redactFailed).toBeUndefined()
+  })
+
+  it('a recursive scrubber using instanceof Object reaches nested objects', () => {
+    const entries = _captureEntries()
+    const scrub = (value: unknown): unknown => {
+      if (typeof value === 'string') return value.replace(/secret/g, '***')
+      if (Array.isArray(value)) return value.map(scrub)
+      if (value instanceof Object)
+        return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v)]))
+      return value
+    }
+    createLogger({ service: 's', redact: { record: (r) => scrub(r) as never } }).info(
+      { a: { b: { c: 'a secret' } }, list: [{ d: 'secret' }], e: new Error('secret!') },
+      'm',
+    )
+    const line = entries[0]!
+    expect(line).toMatchObject({ a: { b: { c: 'a ***' } }, list: [{ d: '***' }] })
+    expect(JSON.stringify(line)).not.toContain('secret')
+    expect(line.redactFailed).toBeUndefined()
+  })
+
+  it('an own __proto__ key in a field stays an own data property', () => {
+    const entries = _captureEntries()
+    let seen: { top: boolean; nested: boolean; polluted: boolean } | undefined
+    const payload = JSON.parse('{"__proto__":{"polluted":"yes"},"inner":{"__proto__":{"x":1}}}')
+    createLogger({
+      service: 's',
+      redact: {
+        record(r) {
+          const fields = r.payload as Record<string, unknown>
+          seen = {
+            top: Object.hasOwn(fields, '__proto__'),
+            nested: Object.hasOwn(fields.inner as object, '__proto__'),
+            polluted: 'polluted' in fields,
+          }
+          return r
+        },
+      },
+    }).info({ payload }, 'm')
+    expect(seen).toEqual({ top: true, nested: true, polluted: false })
+    expect(entries[0]!.payload).toEqual(payload)
+    expect(Object.hasOwn(entries[0]!.payload as object, '__proto__')).toBe(true)
   })
 })
 

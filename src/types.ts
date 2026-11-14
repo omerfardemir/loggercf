@@ -282,8 +282,9 @@ export interface Redactor {
    * The path is the keys from the top of the line: an array item's index is its
    * key (`['args', '0', 'token']`), an `Error`'s properties are keys of its
    * serialized shape (`['err', 'cause', 'message']`, `['errors', '1', 'stack']`),
-   * and a `Map` is an array of `[key, value]` pairs (`['headers', '0', '1']`), so
-   * its keys are not path keys. The same array is reused for every call: copy it
+   * and a `Map` is an array of `[key, value]` pairs, where a string key is the path
+   * key of its value (`['headers', '0', 'authorization']`; `['headers', '0', '1']`
+   * for any other key). The same array is reused for every call: copy it
    * to keep it.
    *
    * Returning `undefined` leaves the key out, as JSON does (`null` in an
@@ -294,14 +295,15 @@ export interface Redactor {
   value?(value: unknown, path: readonly string[]): unknown
   /**
    * Called once per line, after `value()`, with the whole line but `time`,
-   * `level` and the trace IDs, as JSON data (its objects may have no
-   * prototype). Return the line to write, a plain object: it may be the one it
+   * `level` and the trace IDs, as JSON data (ordinary objects and arrays; an own
+   * `__proto__` key stays a key). Return the line to write, a plain object: it may be the one it
    * was given, changed in place. The keys it was not given are written by
    * loggercf whatever it returns.
    *
    * When it throws, or returns anything but a plain object (a Promise
-   * included), the line it was given is written as it is then, with
-   * `redactFailed` naming the failure, and one WARN per isolate.
+   * included), the line fails closed: only `time`, `level`, the trace IDs and
+   * `redactFailed` naming the failure are written, no field, and one WARN per
+   * isolate.
    */
   record?(record: Record<string, unknown>): Record<string, unknown>
 }
@@ -352,7 +354,7 @@ export interface LoggerOptions {
   limits?: LineLimits
   /**
    * Redacts every line of this logger (see `Redactor` and `redactKeys()`).
-   * Omitted or `false`: nothing is redacted, the default. Choose it per
+   * Omitted, `false` or any other falsy value: nothing is redacted, the default. Choose it per
    * environment in code, e.g. on in production and off locally. Define it once,
    * at module scope: the Workers helpers cache their Root Logger by this object.
    */

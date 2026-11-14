@@ -547,6 +547,25 @@ function reenteredCopy(error: Error): LogRecord {
 const thenableSerializers = new WeakMap<ErrorSerializer, string>()
 
 /**
+ * Whether a hook's or serializer's result is a thenable, in words, and the
+ * rejection of a Promise dropped: a rejected Promise is ours to drop, not an
+ * unhandled rejection; another thenable's `then` is user code, left alone.
+ *
+ * @param {unknown} value - What the hook returned.
+ * @returns {string | undefined} `a Promise`, `a thenable`, or `undefined` for anything else.
+ * @throws When `value` is an object whose `then` can't be read (a `Proxy` whose traps throw).
+ */
+function thenableKind(value: unknown): string | undefined {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
+  if (typeof (value as { then?: unknown }).then !== 'function') return undefined
+  if (value instanceof Promise) {
+    value.catch(() => {})
+    return 'a Promise'
+  }
+  return 'a thenable'
+}
+
+/**
  * Why a custom serializer's result can't be written, when it can't: anything
  * but an object, or a thenable (an `async` serializer). Its `Error` is then
  * written as if the serializer threw. A thenable also marks `serializer` as one
@@ -560,10 +579,9 @@ const thenableSerializers = new WeakMap<ErrorSerializer, string>()
 export function invalidResult(result: unknown, serializer: ErrorSerializer): string | undefined {
   if (result === null) return 'serializeError returned null'
   if (typeof result === 'object') {
-    if (typeof (result as { then?: unknown }).then !== 'function') return undefined
-    // A rejected Promise is ours to drop, not an unhandled rejection; another thenable's `then` is user code, left alone.
-    if (result instanceof Promise) result.catch(() => {})
-    const failed = `serializeError returned ${result instanceof Promise ? 'a Promise' : 'a thenable'}`
+    const kind = thenableKind(result)
+    if (kind === undefined) return undefined
+    const failed = `serializeError returned ${kind}`
     thenableSerializers.set(serializer, failed)
     return failed
   }
@@ -1070,6 +1088,10 @@ interface Walk {
   path?: string[]
   /** How many redactor replacements the current value is inside: `value()` is not called there. */
   unredacted: number
+  /** The objects are ordinary (`Object.prototype`), for a redactor's `record()`; otherwise they have no prototype. */
+  ordinary?: boolean
+  /** The `[key, value]` pairs of the Maps met while `redact` is set: the key is the path key of the value. */
+  mapPairs?: WeakSet<object>
 }
 
 /**
@@ -1088,9 +1110,14 @@ let redacting = 0
 /** `redactFailed` on a line logged from inside a redactor hook. */
 export const REDACT_REENTERED = 'logged from inside redact'
 
+/** A name `failureName()` writes as it is: an identifier of a sensible length, never free text. */
+const SAFE_NAME = /^[A-Za-z_$][\w$]{0,63}$/
+
 /**
  * The name of what a hook threw, never its message, which may hold the value
- * it was given: an `Error`'s `name`, or the `typeof` anything else.
+ * it was given: an `Error`'s `name` when it is an identifier of up to 64
+ * characters (a user-controlled `name` could hold anything), `Error` for any
+ * other, or the `typeof` anything else.
  *
  * @param {unknown} thrown - What the hook threw.
  * @returns {string} The name.
@@ -1099,7 +1126,7 @@ function failureName(thrown: unknown): string {
   if (!isError(thrown)) return typeof thrown
   try {
     const name: unknown = thrown.name
-    return typeof name === 'string' && name !== '' ? name : 'Error'
+    return typeof name === 'string' && SAFE_NAME.test(name) ? name : 'Error'
   } catch {
     return 'Error'
   }
@@ -1114,12 +1141,9 @@ function failureName(thrown: unknown): string {
  * @returns {string | undefined} `returned a Promise` (or `a thenable`, `an unreadable value`), or `undefined`.
  */
 function unwritableResult(value: unknown): string | undefined {
-  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined
   try {
-    if (typeof (value as { then?: unknown }).then !== 'function') return undefined
-    if (!(value instanceof Promise)) return 'returned a thenable'
-    value.catch(() => {})
-    return 'returned a Promise'
+    const kind = thenableKind(value)
+    return kind === undefined ? undefined : `returned ${kind}`
   } catch {
     return 'returned an unreadable value'
   }
@@ -1181,9 +1205,28 @@ function redactValue(value: unknown, walk: Walk): unknown {
  */
 function unserializableToJSONValue(thrown: unknown, key: string, walk: Walk): unknown {
   const text = standIn(walk, unserializable(thrown))
-  if (!walk.redact || !redactsHere(walk)) return text
-  const replaced = redactValue(text, walk)
-  return replaced === text ? text : replacementToJSONValue(replaced, key, walk)
+  if (!walk.redact) return text
+  const replaced = redactedToJSONValue(text, key, walk)
+  return replaced === KEPT ? text : replaced
+}
+
+/** What `redactedToJSONValue()` gives when the redactor kept the value. */
+const KEPT = Symbol('kept')
+
+/**
+ * The redactor's `value()` for one value, and what it returned in place of
+ * it, written (see `replacementToJSONValue()`). Called only while `walk.redact`
+ * is set.
+ *
+ * @param {unknown} value - The value, as it will be written.
+ * @param {string} key - Its key in its parent.
+ * @param {Walk} walk - The current walk, with `redact` set.
+ * @returns {unknown} The replacement's JSON-ready value, or `KEPT` when `value()` is not called here or returned `value`.
+ */
+function redactedToJSONValue(value: unknown, key: string, walk: Walk): unknown {
+  if (!redactsHere(walk)) return KEPT
+  const replaced = redactValue(value, walk)
+  return replaced === value ? KEPT : replacementToJSONValue(replaced, key, walk)
 }
 
 /**
@@ -1322,17 +1365,17 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   const text = typeof value === 'string' ? value : walkText(value, walk)
   if (walk.inRepeat > 0) charge(walk, key, text)
   if (text !== undefined) {
-    if (walk.redact && redactsHere(walk)) {
-      const replaced = redactValue(text, walk)
-      if (replaced !== text) return replacementToJSONValue(replaced, key, walk)
+    if (walk.redact) {
+      const replaced = redactedToJSONValue(text, key, walk)
+      if (replaced !== KEPT) return replaced
     }
     if (text !== value) standIn(walk, text) // a strict walk gives up
     return walk.inRepeat > 0 ? text : stringToJSONValue(text, walk)
   }
   if (typeof value !== 'object' || value === null) {
-    if (value !== undefined && walk.redact && redactsHere(walk)) {
-      const replaced = redactValue(value, walk)
-      if (replaced !== value) return replacementToJSONValue(replaced, key, walk)
+    if (value !== undefined && walk.redact) {
+      const replaced = redactedToJSONValue(value, key, walk)
+      if (replaced !== KEPT) return replaced
     }
     return value
   }
@@ -1379,9 +1422,9 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   if (isError(object)) return errorToJSONValue(object, key, walk)
 
   // After `toJSON` and an `Error`'s copy: what the redactor sees is what is written.
-  if (walk.redact && redactsHere(walk)) {
-    const replaced = redactValue(object, walk)
-    if (replaced !== object) return replacementToJSONValue(replaced, key, walk)
+  if (walk.redact) {
+    const replaced = redactedToJSONValue(object, key, walk)
+    if (replaced !== KEPT) return replaced
   }
 
   walk.ancestors.add(object)
@@ -1579,8 +1622,14 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
   let length = 0
   let boxed: { value: unknown } | undefined
   try {
-    if (object instanceof Map) items = Array.from(object)
-    else if (object instanceof Set) items = Array.from(object)
+    if (object instanceof Map) {
+      items = Array.from(object)
+      // A string key is the path key of its value (see below), so a redactor matches it.
+      if (walk.path) {
+        walk.mapPairs ??= new WeakSet()
+        for (const pair of items as unknown[][]) walk.mapPairs.add(pair)
+      }
+    } else if (object instanceof Set) items = Array.from(object)
     else if (Array.isArray(object)) items = object
     // `new Number(1)`, as JSON writes it; a `null` prototype may hold a boxed one too.
     else if (Object.getPrototypeOf(object) !== Object.prototype) boxed = unbox(object)
@@ -1603,6 +1652,8 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
   const { path } = walk
   const depth = path?.length ?? 0
   if (items) {
+    const mapKey =
+      path && walk.mapPairs?.has(object) && typeof items[0] === 'string' ? items[0] : undefined
     const out: unknown[] = []
     for (let i = 0; i < length; i++) {
       let item: unknown
@@ -1614,7 +1665,7 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
       const index = String(i)
       if (path) {
         path.length = depth // a redactor may have changed it
-        path.push(index)
+        path.push(i === 1 && mapKey !== undefined ? mapKey : index)
       }
       const converted = toJSONValue(item, index, walk) ?? null
       out.push(
@@ -1627,7 +1678,9 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     return out
   }
 
-  const out: LogRecord = Object.create(null) // an own `__proto__` key stays a key
+  // An own `__proto__` key stays a key: on an ordinary object, only by defining it.
+  const ordinary = walk.ordinary === true
+  const out: LogRecord = ordinary ? {} : Object.create(null)
   for (const key of keys!) {
     let child: unknown
     try {
@@ -1641,15 +1694,34 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     }
     const converted = toJSONValue(child, key, walk)
     if (converted === undefined) continue
-    out[key] =
+    const written =
       typeof converted === 'string' &&
       converted.length > walk.maxString &&
       !keepsLength(object, key, walk.record!)
         ? cutString(converted, walk.maxString)
         : converted
+    if (ordinary && key === '__proto__') defineOwn(out, key, written)
+    else out[key] = written
   }
   if (path) path.length = depth
   return out
+}
+
+/**
+ * Set an own data property, even `__proto__`, which an assignment would take
+ * as the prototype of an ordinary object.
+ *
+ * @param {object} object - The object.
+ * @param {string} key - The key.
+ * @param {unknown} value - The value.
+ */
+function defineOwn(object: object, key: string, value: unknown): void {
+  Object.defineProperty(object, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  })
 }
 
 /**
@@ -1751,7 +1823,7 @@ export function stringifyRecord(record: LogRecord): string {
  * @returns {string} One JSON line, before `maxRecordBytes`.
  */
 function writeRedacted(record: LogRecord, options: LineOptions, redact: LineRedactor): string {
-  if (redacting > 0) return JSON.stringify(reenteredLine(record))
+  if (redacting > 0) return JSON.stringify(failedLine(record, REDACT_REENTERED))
   const budget = lineBudgets.get(record) ?? newBudget()
   const errors =
     (record as WithLineErrors)[LINE_ERRORS] ?? newSerializedErrors(options.serializeError)
@@ -1769,23 +1841,28 @@ function writeRedacted(record: LogRecord, options: LineOptions, redact: LineReda
     return JSON.stringify(toJSONValue(record, '', walk, false))
   }
   // Built uncut: `record()` sees whole strings, and its result is cut once.
+  walk.ordinary = true // `record()` is given objects it can call `hasOwnProperty` on
   const copy = toJSONValue(record, '', walk, false) as LogRecord
   return writeRecord(recordHook(copy, redact), options)
 }
 
 /**
- * The line logged from inside a redactor hook: only the keys a redactor is
- * never given, and `redactFailed`.
+ * The line written when a redactor hook can't be trusted with the rest: only
+ * the keys a redactor is never given (`NEVER_REDACTED`), and `redactFailed`
+ * after `level`. It holds no field value, so it can't hold what the redactor
+ * was there to hide. A line logged from inside a hook, and a line whose
+ * `record()` failed, are this.
  *
- * @param {LogRecord} record - The record.
+ * @param {LogRecord} record - The record, or its copy.
+ * @param {string} failed - The `redactFailed` text.
  * @returns {LogRecord} The line.
  */
-function reenteredLine(record: LogRecord): LogRecord {
+function failedLine(record: LogRecord, failed: string): LogRecord {
   const line: LogRecord = {}
-  for (const key of ['time', 'level'] as const)
+  for (const key of NEVER_REDACTED) {
     if (typeof record[key] === 'string') line[key] = record[key]
-  line.redactFailed = REDACT_REENTERED
-  for (const key of TRACE_KEYS) if (typeof record[key] === 'string') line[key] = record[key]
+    if (key === 'level') line.redactFailed = failed
+  }
   return line
 }
 
@@ -1806,17 +1883,22 @@ function kindOf(result: unknown): string {
 /**
  * Hand the line's JSON-ready copy to the redactor's `record()`, and put back
  * the keys it is never given (`NEVER_REDACTED`), where they were. Never
- * throws: when it throws, or returns anything but a plain object (a Promise
- * included), the copy it was given is kept, as it is then, with
- * `redactFailed`.
+ * throws, and fails closed: when `record()` throws, or returns anything but a
+ * plain object (a Promise included), no field is written, as it may have
+ * changed some in place and left others unredacted: the line is only
+ * `failedLine()`.
  *
  * @param {LogRecord} copy - The line's copy, from the walk.
  * @param {LineRedactor} redact - The redactor, which has a `record()`.
  * @returns {LogRecord} The line to write.
  */
 function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
-  const given: LogRecord = Object.create(null)
-  for (const key of Object.keys(copy)) if (!NEVER_REDACTED.has(key)) given[key] = copy[key]
+  // `Object.fromEntries` defines an own `__proto__` key as data, where an assignment would not.
+  const given = Object.fromEntries(
+    Object.keys(copy)
+      .filter((key) => !NEVER_REDACTED.has(key))
+      .map((key) => [key, copy[key]]),
+  )
   let entries: [string, unknown][] | undefined
   let failed: string | undefined
   redacting++
@@ -1831,14 +1913,14 @@ function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
   } finally {
     redacting--
   }
-  if (failed !== undefined) {
+  if (failed !== undefined || entries === undefined) {
+    failed ??= 'record() returned nothing'
     redact.failed('record', failed)
-    entries = readEntries(given)
+    return failedLine(copy, failed)
   }
   const line: LogRecord = Object.create(null)
   for (const key of ['time', 'level'] as const) if (key in copy) line[key] = copy[key]
-  for (const [key, value] of entries!) if (!NEVER_REDACTED.has(key)) line[key] = value
-  if (failed !== undefined) line.redactFailed = failed
+  for (const [key, value] of entries) if (!NEVER_REDACTED.has(key)) line[key] = value
   for (const key of TRACE_KEYS) if (key in copy) line[key] = copy[key]
   return line
 }

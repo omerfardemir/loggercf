@@ -26,6 +26,7 @@ import {
   prototypeMethods,
   registerRootLogger,
   runLogged,
+  rootLoggerSource,
   sameRootLoggerSource,
   type Method,
   type RootLoggerSource,
@@ -96,8 +97,7 @@ export function withScheduled<E = Cloudflare.Env, R = void | Promise<void>>(
   handler: (controller: ScheduledController, env: E, ctx: ExecutionContext) => R,
   options: HandlerOptions<E> = {},
 ): (controller: ScheduledController, env: E, ctx: ExecutionContext) => R {
-  const { env: mapping, serializeError, redact } = options
-  const source: RootLoggerSource<E> = { env: mapping, serializeError, redact }
+  const source = rootLoggerSource(options)
   return function scheduled(this: unknown, controller, env, ctx) {
     return runLogged(
       {
@@ -263,8 +263,7 @@ export function withWorkflow<C extends WorkflowClass>(
     )
   }
 
-  const { env: mapping, serializeError, redact } = options
-  const source: RootLoggerSource<any> = { env: mapping, serializeError, redact }
+  const source = rootLoggerSource<any>(options)
   /** The Root Logger for one Workflow instance, from its env. */
   const instanceRootLogger = (target: object) =>
     envRootLogger((target as { env: unknown }).env, source)

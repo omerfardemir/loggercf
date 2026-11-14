@@ -19,6 +19,7 @@ import {
   prototypeMethods,
   registerRootLogger,
   runLogged,
+  rootLoggerSource,
   sameRootLoggerSource,
   withCodeOptions,
   type CodeOptions,
@@ -85,8 +86,7 @@ export function defaultLoggerFromEnv<E = Cloudflare.Env>(
   mapping?: EnvMapping<E>,
   options: CodeOptions = {},
 ): Logger {
-  const { serializeError, redact } = options
-  const logger = envRootLogger(workersEnv, { env: mapping, serializeError, redact })
+  const logger = envRootLogger(workersEnv, rootLoggerSource({ ...options, env: mapping }))
   registerDefaultLogger(logger)
   return logger
 }
@@ -780,7 +780,7 @@ export function withLogging<C extends EntrypointClass | DurableObjectSubclass>(
     }
   }
 
-  const source: RootLoggerSource<any> = { env: mapping, serializeError, redact }
+  const source = rootLoggerSource<any>(options)
 
   /**
    * The Root Logger for one wrapped instance (an entrypoint or a Durable Object): its own

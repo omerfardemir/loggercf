@@ -49,6 +49,18 @@ export interface RootLoggerSource<E = unknown> {
 export type CodeOptions = Pick<RootLoggerSource, 'serializeError' | 'redact'>
 
 /**
+ * A helper's Root Logger source: the `env`, `serializeError` and `redact` of its
+ * options, and nothing else. One place to list them, for every helper.
+ *
+ * @param {RootLoggerSource<E>} options - A helper's options.
+ * @returns {RootLoggerSource<E>} Its Root Logger source.
+ */
+export function rootLoggerSource<E>(options: RootLoggerSource<E>): RootLoggerSource<E> {
+  const { env, serializeError, redact } = options
+  return { env, serializeError, redact }
+}
+
+/**
  * Whether two helpers' Root Logger sources are the same: the same Env Mapping
  * (see `sameEnvMapping()`), the same `serializeError` function and the same
  * `redact` object (`false` and absent are the same).
@@ -81,16 +93,16 @@ const ABSENT = {}
 let rootLoggers = new WeakMap<object, WeakMap<object, Map<string, Logger>>>()
 
 /** A code-only option that is cached by identity. */
-type CodeOption = 'serializeError' | 'redact'
+type CodeOptionKey = 'serializeError' | 'redact'
 
 /** The functions and objects of each code-only option Root Loggers were built with in this isolate. */
-let codeSeen: Record<CodeOption, WeakSet<object>> = {
+let codeSeen: Record<CodeOptionKey, WeakSet<object>> = {
   serializeError: new WeakSet(),
   redact: new WeakSet(),
 }
 
 /** How many of each code-only option have had Root Loggers built in this isolate. */
-let codeCounts: Record<CodeOption, number> = { serializeError: 0, redact: 0 }
+let codeCounts: Record<CodeOptionKey, number> = { serializeError: 0, redact: 0 }
 
 /**
  * Past this many `serializeError` functions, or `redact` objects, one WARN says a
@@ -123,11 +135,11 @@ function optionsKey(options: LoggerOptions): string {
  * Count a code-only option's function or object the first time it is seen. The
  * first one past `MAX_CODE_OPTIONS` writes one WARN per isolate.
  *
- * @param {CodeOption} option - Which option.
+ * @param {CodeOptionKey} option - Which option.
  * @param {object} value - Its function or object.
  * @param {LoggerOptions} options - The Logger Options, for the warning.
  */
-function countCodeOption(option: CodeOption, value: object, options: LoggerOptions): void {
+function countCodeOption(option: CodeOptionKey, value: object, options: LoggerOptions): void {
   const seen = codeSeen[option]
   if (seen.has(value)) return
   seen.add(value)
