@@ -535,25 +535,50 @@ function reenteredCopy(error: Error): LogRecord {
 }
 
 /**
+ * The serializers that returned a thenable (an `async` one), with what they
+ * returned (`serializeError returned a Promise` or `... a thenable`). Its body
+ * keeps running after the first `await`, where nothing marks a line as logged
+ * from inside it, so a serializer that logs there would call itself again and
+ * again. Such a serializer is never called again in this isolate: its Errors
+ * are written in the default shape with that failure, the same text as on the
+ * call that returned the thenable. Weak, so a serializer built per call is
+ * collected.
+ */
+const thenableSerializers = new WeakMap<ErrorSerializer, string>()
+
+/**
  * Why a custom serializer's result can't be written, when it can't: anything
  * but an object, or a thenable (an `async` serializer). Its `Error` is then
- * written as if the serializer threw.
+ * written as if the serializer threw. A thenable also marks `serializer` as one
+ * to call no more (see `thenableFailure()`).
  *
  * @param {unknown} result - What the serializer returned.
+ * @param {ErrorSerializer} serializer - The serializer that returned it.
  * @returns {string | undefined} `serializeError returned <kind>`, or `undefined` for an object.
  * @throws When `result` is an object whose `then` can't be read (a `Proxy` whose traps throw).
  */
-export function invalidResult(result: unknown): string | undefined {
+export function invalidResult(result: unknown, serializer: ErrorSerializer): string | undefined {
   if (result === null) return 'serializeError returned null'
   if (typeof result === 'object') {
     if (typeof (result as { then?: unknown }).then !== 'function') return undefined
     // A rejected Promise is ours to drop, not an unhandled rejection; another thenable's `then` is user code, left alone.
     if (result instanceof Promise) result.catch(() => {})
-    return `serializeError returned ${result instanceof Promise ? 'a Promise' : 'a thenable'}`
+    const failed = `serializeError returned ${result instanceof Promise ? 'a Promise' : 'a thenable'}`
+    thenableSerializers.set(serializer, failed)
+    return failed
   }
   const kind = typeof result
   return `serializeError returned ${kind === 'undefined' ? 'undefined' : `a ${kind}`}`
 }
+
+/**
+ * Why `serializer` is not called, when an earlier call returned a thenable.
+ *
+ * @param {ErrorSerializer} serializer - The serializer.
+ * @returns {string | undefined} `serializeError returned a Promise` (or `a thenable`), or `undefined` when it may be called.
+ */
+export const thenableFailure = (serializer: ErrorSerializer): string | undefined =>
+  thenableSerializers.get(serializer)
 
 /**
  * The default shape of `error`, as `defaultSerialize` gives it to a custom
@@ -597,7 +622,9 @@ function shallowCopy(error: Error, cache: SerializedErrors): LogRecord {
  * Budget apply. An `Error` it returns (`error` itself included) is written in
  * its default shape. When it throws, or returns anything but an object (or a
  * thenable, see `invalidResult()`), `error` is written in its default shape,
- * with `serializeErrorFailed` describing the failure. Never throws.
+ * with `serializeErrorFailed` describing the failure. A serializer that
+ * returned a thenable once is not called again (see `thenableSerializers`).
+ * Never throws.
  *
  * @param {Error} error - The `Error`.
  * @param {CustomErrors} custom - The line's custom copies.
@@ -607,16 +634,18 @@ function shallowCopy(error: Error, cache: SerializedErrors): LogRecord {
 function customCopy(error: Error, custom: CustomErrors, cache: SerializedErrors): unknown {
   if (custom.copies.has(error)) return custom.copies.get(error)
   let copy: unknown
-  let failed: string | undefined
-  serializing++
-  try {
-    const result = custom.serialize(error, (e) => defaultCopy(e, custom, cache))
-    failed = invalidResult(result)
-    if (failed === undefined) copy = ownedCopy(result as object, error, custom, cache)
-  } catch (thrown) {
-    failed = describeFailure(thrown)
-  } finally {
-    serializing--
+  let failed = thenableFailure(custom.serialize)
+  if (failed === undefined) {
+    serializing++
+    try {
+      const result = custom.serialize(error, (e) => defaultCopy(e, custom, cache))
+      failed = invalidResult(result, custom.serialize)
+      if (failed === undefined) copy = ownedCopy(result as object, error, custom, cache)
+    } catch (thrown) {
+      failed = describeFailure(thrown)
+    } finally {
+      serializing--
+    }
   }
   if (failed !== undefined) {
     const out = shallowCopy(error, cache)
@@ -864,6 +893,7 @@ export function buildRecord(
   if (options) (record as WithLineOptions)[LINE_OPTIONS] = options
   if (context) applyTrace(record, context.trace)
   const { budget } = entry
+  if (budget?.texts) (record as WithLineTexts)[LINE_TEXTS] = budget.texts
   if (budget && (budget.values < MAX_REWRITTEN_VALUES || budget.chars < MAX_REWRITTEN_CHARS))
     lineBudgets.set(record, budget) // only when the message spent some of it
   return record
@@ -905,6 +935,12 @@ export interface Budget {
   values: number
   /** Characters left (see `MAX_REWRITTEN_CHARS`). */
   chars: number
+  /**
+   * The long texts (see `LONG_STRING`) the line worked out so far, made on the
+   * first one: the message, the fast path and the walk of the record share it,
+   * so a long `BigInt` is converted to text once per line.
+   */
+  texts?: Map<unknown, string>
 }
 
 /**
@@ -930,6 +966,15 @@ const LINE_ERRORS: unique symbol = Symbol('loggercf.lineErrors')
 
 /** A record, as it holds `LINE_ERRORS`. */
 type WithLineErrors = { [LINE_ERRORS]?: SerializedErrors }
+
+/**
+ * The key a record holds the line's long texts under (`Budget.texts`), when
+ * it has any, for `stringifyRecord()` (see `LINE_ERRORS`).
+ */
+const LINE_TEXTS: unique symbol = Symbol('loggercf.lineTexts')
+
+/** A record, as it holds `LINE_TEXTS`. */
+type WithLineTexts = { [LINE_TEXTS]?: Map<unknown, string> }
 
 /** The key a record holds its logger's `LineOptions` under, when it has any (see `LINE_ERRORS`). */
 const LINE_OPTIONS: unique symbol = Symbol('loggercf.lineOptions')
@@ -1258,7 +1303,8 @@ function standIn(walk: Walk, text: string): string {
  * `[key, value]` pairs, a `Set` an array; a `BigInt` is its digits, a
  * function `[Function: name]`, a symbol `Symbol(description)` (boxed or
  * not); an `Error` is its `defaultErrorShape()` copy (see `errorToJSONValue()`),
- * unless it has a `toJSON`, which JSON calls first; a real cycle is
+ * unless it has a `toJSON`, which JSON calls first (not under a `serializeError`,
+ * or on a line logged from inside one, where the `Error` is written first); a real cycle is
  * `"[Circular]"` (a `toJSON` result that refers back to
  * its object included); a repeated object (one with a `toJSON` included), or
  * a repeated long string, is written again within the Re-write Budget (see `MAX_REWRITTEN_VALUES` and `MAX_REWRITTEN_CHARS`), then
@@ -1294,7 +1340,11 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
 
   if (walk.ancestors.has(object)) return standIn(walk, '[Circular]')
 
-  if (useToJSON) {
+  // Under a `serializeError` (or inside one) the serializer wins at every depth: an `Error` is
+  // written by it, not by its class's `toJSON`; and `%j` gives up at an `Error` before calling
+  // its `toJSON`, as it does at one without. Without either, nothing is checked but a field.
+  const errorFirst = walk.errors ? serializerWins(walk.errors) : walk.strict
+  if (useToJSON && !(errorFirst && isError(object))) {
     let toJSON: unknown
     try {
       toJSON = (object as { toJSON?: unknown }).toJSON
@@ -1357,6 +1407,17 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
     if (entered) errors?.ancestors.delete(entered)
   }
 }
+
+/**
+ * Whether an `Error` met in a value is written before its `toJSON` is called:
+ * the line's logger has a `serializeError`, or a line is being logged from
+ * inside one (so its Errors are only `reenteredCopy()`, whatever their class).
+ *
+ * @param {SerializedErrors} errors - The line's cache.
+ * @returns {boolean} `true` when an `Error` goes through `errorCopy()` first.
+ */
+const serializerWins = (errors: SerializedErrors): boolean =>
+  errors.custom !== undefined || serializing > 0
 
 /**
  * The `Error` part of `toJSONValue()`: its copy from `defaultErrorShape()`,
@@ -1446,29 +1507,64 @@ const BOXES: readonly [object, (this: unknown) => unknown][] = [
 ]
 
 /**
+ * The `valueOf` of each primitive in `BOXES`, by the tag
+ * `Object.prototype.toString` gives a boxed one from any realm.
+ */
+const BOX_TAGS = new Map<string, (this: unknown) => unknown>([
+  ['[object Number]', Number.prototype.valueOf],
+  ['[object String]', String.prototype.valueOf],
+  ['[object Boolean]', Boolean.prototype.valueOf],
+  ['[object BigInt]', BigInt.prototype.valueOf],
+  ['[object Symbol]', Symbol.prototype.valueOf],
+])
+
+/**
  * The primitive inside a boxed primitive (`new Number(1)`, `Object(1n)`),
- * told by its brand, as `JSON.stringify` tells it. Only an object that
- * inherits from that primitive's prototype is checked, since a failed check
- * throws, which is slow; a boxed primitive moved to another prototype
- * (`Object.setPrototypeOf`) is written as an object here. The fast path of
- * `stringifyRecord()` writes it as `JSON.stringify` does, through that
- * prototype's methods (`null` for a Number moved to `{}`).
+ * told by its brand, as `JSON.stringify` tells it. An object of this realm
+ * is checked only when it inherits from that primitive's prototype, since a
+ * failed check throws, which is slow; a boxed primitive moved to another
+ * prototype (`Object.setPrototypeOf(box, {})`) is written as an object here.
+ * One from another realm (a `vm` context) or with a `null` prototype inherits
+ * none of them: its tag picks the one to check, as it is rare. The fast path
+ * of `stringifyRecord()` hands every boxed primitive to this walk (see
+ * `isBoxed()`), so a boxed string counts toward the Re-write Budget and the
+ * repeat rules, and `maxStringLength` cuts it.
  *
  * @param {object} object - Any object that is not a plain object or an array.
  * @returns {{ value: unknown } | undefined} The primitive, or `undefined` when `object` is not boxed.
  * @throws When its prototype cannot be read (a `Proxy` whose `getPrototypeOf` throws).
  */
 function unbox(object: object): { value: unknown } | undefined {
+  let found: ((this: unknown) => unknown) | undefined
   for (const [prototype, valueOf] of BOXES) {
-    if (!Object.prototype.isPrototypeOf.call(prototype, object)) continue
-    try {
-      return { value: valueOf.call(object) }
-    } catch {
-      return undefined // a fake: `Object.create(Number.prototype)`
+    if (Object.prototype.isPrototypeOf.call(prototype, object)) {
+      found = valueOf
+      break
     }
   }
-  return undefined
+  if (!found && !Object.prototype.isPrototypeOf.call(Object.prototype, object)) {
+    try {
+      found = BOX_TAGS.get(Object.prototype.toString.call(object))
+    } catch {
+      return undefined // a tag that throws: not a boxed primitive this walk can tell
+    }
+  }
+  if (!found) return undefined
+  try {
+    return { value: found.call(object) }
+  } catch {
+    return undefined // a fake: `Object.create(Number.prototype)`
+  }
 }
+
+/**
+ * Whether `object` is a boxed primitive, as `unbox()` tells it.
+ *
+ * @param {object} object - Any object that is not a plain object or an array.
+ * @returns {boolean} `true` when it is one.
+ * @throws When its prototype cannot be read (a `Proxy` whose `getPrototypeOf` throws).
+ */
+const isBoxed = (object: object): boolean => unbox(object) !== undefined
 
 /**
  * The object part of `toJSONValue()`: its items or entries, each converted.
@@ -1486,7 +1582,8 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     if (object instanceof Map) items = Array.from(object)
     else if (object instanceof Set) items = Array.from(object)
     else if (Array.isArray(object)) items = object
-    else if (!isPlainObject(object)) boxed = unbox(object) // `new Number(1)`, as JSON writes it
+    // `new Number(1)`, as JSON writes it; a `null` prototype may hold a boxed one too.
+    else if (Object.getPrototypeOf(object) !== Object.prototype) boxed = unbox(object)
     if (!items && !boxed) keys = Object.keys(object)
     length = items?.length ?? 0
   } catch (thrown) {
@@ -1612,7 +1709,7 @@ const MAX_FAST_CHARS = 1024 * 1024
  * Most lines take a fast path: native `JSON.stringify`, which gives up on
  * the first object or long text seen twice (a repeat or a cycle, an object
  * whose `toJSON` was already called included), object a getter returns,
- * boxed symbol, `Error` (one `buildRecord()` has not serialized already), or
+ * boxed primitive, `Error` (one `buildRecord()` has not serialized already), or
  * getter or `toJSON` that throws, and after
  * `MAX_FAST_VALUES` values or `MAX_FAST_CHARS` characters. Those lines are
  * written again by the `toJSONValue()` walk, so a getter (and a `toJSON`) on
@@ -1757,7 +1854,10 @@ function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
  */
 function writeRecord(record: LogRecord, options: LineOptions | undefined): string {
   const maxString = options?.maxStringLength ?? Infinity
+  let texts: Map<unknown, string> | undefined // the record's, read at each BigInt until one is found
   if (typeof record.toJSON !== 'function') {
+    // Under a `serializeError` (or inside one) an `Error` is written before its `toJSON` is called.
+    const errorsFirst = options?.serializeError !== undefined || serializing > 0
     const seen = new WeakSet<object>()
     let strings: Set<string> | undefined
     let values = 0
@@ -1766,7 +1866,32 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
       return JSON.stringify(record, function (this: unknown, key: string, value: unknown) {
         if (++values > MAX_FAST_VALUES) throw NEEDS_WALK
         chars += key.length
-        const text = typeof value === 'string' ? value : nonJSONText(value)
+        // Read through the descriptor, so a getter does not run twice.
+        let descriptor: PropertyDescriptor | undefined
+        if (errorsFirst) {
+          descriptor = Object.getOwnPropertyDescriptor(this, key)
+          // Native `JSON.stringify` already called its `toJSON`, whatever it returned: the walk
+          // writes the `Error` instead. A getter may have returned one.
+          if (descriptor?.get) throw NEEDS_WALK
+          if (descriptor?.value !== value && isError(descriptor?.value)) throw NEEDS_WALK
+        }
+        let text: string | undefined
+        if (typeof value === 'string') {
+          text = value
+        } else if (typeof value === 'bigint') {
+          // A long one is kept: its repeat, the walk and the message do not convert it again.
+          texts ??= (record as WithLineTexts)[LINE_TEXTS]
+          text = texts?.get(value)
+          if (text === undefined) {
+            text = String(value)
+            if (text.length >= LONG_STRING) {
+              texts ??= new Map()
+              texts.set(value, text)
+            }
+          }
+        } else {
+          text = nonJSONText(value)
+        }
         if (text !== undefined) {
           chars += text.length
           if (chars > MAX_FAST_CHARS) throw NEEDS_WALK
@@ -1783,8 +1908,7 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
         if (typeof value !== 'object' || value === null) return value
         if (seen.has(value)) throw NEEDS_WALK
         seen.add(value)
-        // Read through the descriptor, so a getter does not run twice.
-        const descriptor = Object.getOwnPropertyDescriptor(this, key)
+        descriptor ??= Object.getOwnPropertyDescriptor(this, key)
         // A getter may return the same object every time: a repeat this path cannot see.
         if (descriptor?.get) throw NEEDS_WALK
         // A `toJSON` result: the object it was called on is what repeats, as in the walk.
@@ -1797,7 +1921,8 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
         const prototype: unknown = Object.getPrototypeOf(value)
         if (prototype === Object.prototype || prototype === Array.prototype) return value
         if (value instanceof Map || value instanceof Set) return Array.from(value)
-        if (prototype === Symbol.prototype) throw NEEDS_WALK // a boxed symbol: JSON writes `{}`
+        // A boxed primitive: JSON unwraps it after this, unseen by the caps and the repeat rules.
+        if (isBoxed(value)) throw NEEDS_WALK
         // An `Error` inside a value: the walk serializes it, nested in the Errors around it.
         if (isError(value)) throw NEEDS_WALK
         return value
@@ -1810,6 +1935,8 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
   const errors =
     (record as WithLineErrors)[LINE_ERRORS] ?? newSerializedErrors(options?.serializeError)
   const walk = newWalk(false, budget, undefined, errors)
+  texts ??= (record as WithLineTexts)[LINE_TEXTS]
+  if (texts) walk.texts = texts
   if (maxString !== Infinity) {
     walk.maxString = maxString
     walk.record = record
@@ -1832,6 +1959,12 @@ export interface MessagePrinter {
    * the message whenever this returns `true`.
    */
   admit(text: string): boolean
+  /**
+   * The digits of a `BigInt` argument. A long one is converted once per
+   * line, whichever placeholder or word asks, and the record's walk
+   * reuses the text.
+   */
+  digits(value: bigint): string
 }
 
 /**
@@ -1881,6 +2014,14 @@ export function inlinePrinter(budget: Budget): MessagePrinter {
         return true
       }
       return spend(budget, { values: 0, chars: text.length })
+    },
+    digits(value) {
+      let text = budget.texts?.get(value)
+      if (text === undefined) {
+        text = String(value)
+        if (text.length >= LONG_STRING) (budget.texts ??= new Map()).set(value, text)
+      }
+      return text
     },
   }
 }

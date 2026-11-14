@@ -183,13 +183,17 @@ export interface ALSStore<T extends LogFields = LogFields> {
  * `Error` is written in the default shape, with `serializeErrorFailed`
  * describing the failure. So is a result that is not an object, or is a
  * Promise (`serializeError returned undefined`, `... a Promise`): it must
- * return an object, synchronously.
+ * return an object, synchronously. A serializer that returned a Promise (or
+ * another thenable) once is not called again in this isolate: its Errors are
+ * written in the default shape, with the same `serializeErrorFailed`. So an
+ * `async` serializer that logs after an `await` can't call itself again.
  *
  * A line logged while it runs (its own code logs), through any logger, writes
  * each `Error` as only `{ type, message, serializeErrorFailed: 'logged from
  * inside serializeError' }`, so a synchronous serializer can't call itself
- * again or write what it leaves out (an `Error` nested two or more levels deep
- * whose class has its own `toJSON` is still written by that `toJSON`).
+ * again or write what it leaves out. Both hold at every depth: an `Error`
+ * nested two or more levels deep is written by the serializer (or that
+ * minimal shape) even when its class has its own `toJSON`.
  *
  * `defaultSerialize(e)` gives `e`'s default shape, with the values inside it
  * (`cause`, an `Error`-valued property, `errors`) kept as they are: loggercf
