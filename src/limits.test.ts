@@ -20,19 +20,36 @@ const bytes = (line: string) => Buffer.byteLength(line, 'utf8')
 const strip = (line: string) => line.replace(/"(time|spanId)":"[^"]+"/g, '')
 
 /**
- * The fastest of 3 lines with `n` small fields, trimmed to 10,000 bytes, in milliseconds.
+ * The fastest of 3 lines carrying `fields`, trimmed to 10,000 bytes, in milliseconds.
  *
- * @param {number} n - How many fields.
+ * @param {Record<string, unknown>} fields - The fields of the line.
  * @returns {number} The time.
  */
-function trimTime(n: number): number {
-  const fields = Object.fromEntries(
-    Array.from({ length: n }, (_, i) => [`k${i}`, { s: 'v'.repeat(30 + (i % 50)) }]),
-  )
+function trimTime(fields: Record<string, unknown>): number {
   const { log } = limited({ maxRecordBytes: 10_000 })
   log((l) => l.info(fields)) // warm up
   return Math.min(...Array.from({ length: 3 }, () => elapsed(() => log((l) => l.info(fields)))))
 }
+
+/**
+ * `n` fields whose values are small objects of 30 to 79 characters.
+ *
+ * @param {number} n - How many fields.
+ * @returns {Record<string, unknown>} The fields.
+ */
+const nestedFields = (n: number) =>
+  Object.fromEntries(
+    Array.from({ length: n }, (_, i) => [`k${i}`, { s: 'v'.repeat(30 + (i % 50)) }]),
+  )
+
+/**
+ * `n` flat fields of 60 characters.
+ *
+ * @param {number} n - How many fields.
+ * @returns {Record<string, unknown>} The fields.
+ */
+const flatFields = (n: number) =>
+  Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 'v'.repeat(60)]))
 
 /**
  * A 60-byte string, different for each `i`.
@@ -56,19 +73,6 @@ function lastResortTime(n: number): number {
   const ms = Math.min(...Array.from({ length: 3 }, () => elapsed(run)))
   expect(bytes(lines.at(-1)!)).toBeLessThanOrEqual(1024)
   return ms
-}
-
-/**
- * The fastest of 3 lines with `n` flat 60-byte fields, trimmed to 10,000 bytes, in milliseconds.
- *
- * @param {number} n - How many fields.
- * @returns {number} The time.
- */
-function tailTime(n: number): number {
-  const fields = Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 'v'.repeat(60)]))
-  const { log } = limited({ maxRecordBytes: 10_000 })
-  log((l) => l.info(fields)) // warm up
-  return Math.min(...Array.from({ length: 3 }, () => elapsed(() => log((l) => l.info(fields)))))
 }
 
 /** A logger with `limits`, inside a Logging Context, and the lines it writes. */
@@ -400,6 +404,85 @@ describe('limits.maxRecordBytes', () => {
     }
   })
 
+  it('values of a few hundred bytes keep the leading ones whole, then one "[Trimmed]" entry', () => {
+    const cases: [string, number][] = [
+      ['é'.repeat(150), 4096],
+      ['😀"\n€'.repeat(20), 2048],
+    ]
+    for (const [text, max] of cases) {
+      const { lines, log, parsed } = limited({ maxRecordBytes: max })
+      log((l) =>
+        l.info(Object.fromEntries(Array.from({ length: 3000 }, (_, i) => [`k${i}`, text])), 'm'),
+      )
+      expect(bytes(lines[0])).toBeLessThanOrEqual(max)
+      const line = parsed()
+      expect(line.logError).toBeUndefined()
+      expect(line.k0).toBe(text)
+      expect(line.k1).toBe(text)
+      expect(Object.keys(line).at(-1)).toBe('[Trimmed]')
+      expect(line['[Trimmed]']).toMatch(/^\[Trimmed: \d+ keys, \d+ bytes\]$/)
+      // No value became a marker: every one of them is whole.
+      const kept = Object.keys(line).filter((k) => /^k\d+$/.test(k))
+      expect(kept.length).toBeGreaterThan(5)
+      for (const key of kept) expect(line[key]).toBe(text)
+      expect(lines[0]).not.toContain('truncated from')
+    }
+  })
+
+  it('still cuts the one huge value first, and keeps the medium ones whole', () => {
+    const { lines, log, parsed } = limited({ maxRecordBytes: 12_000 })
+    const medium = 'é'.repeat(100)
+    log((l) =>
+      l.info(
+        {
+          before: medium,
+          huge: 'h'.repeat(20_000),
+          ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, medium])),
+        },
+        'm',
+      ),
+    )
+    expect(bytes(lines[0])).toBeLessThanOrEqual(12_000)
+    expect(bytes(lines[0])).toBeGreaterThan(11_000)
+    const line = parsed()
+    expect(line.huge).toMatch(/^h+…\[truncated from 20000 chars\]$/)
+    expect(line.before).toBe(medium)
+    expect(line.k39).toBe(medium)
+    expect(line['[Trimmed]']).toBeUndefined()
+  })
+
+  it('a wide object of medium values nested in a field keeps its leading values whole', () => {
+    const { lines, log, parsed } = limited({ maxRecordBytes: 4096 })
+    const text = 'x'.repeat(200)
+    log((l) =>
+      l.info({
+        wide: Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`w${i}`, text])),
+        after: 'a',
+      }),
+    )
+    expect(bytes(lines[0])).toBeLessThanOrEqual(4096)
+    const line = parsed()
+    expect(line.after).toBe('a')
+    expect(line.wide.w0).toBe(text)
+    expect(line.wide['[Trimmed]']).toMatch(/^\[Trimmed: \d+ keys, \d+ bytes\]$/)
+    expect(lines[0]).not.toContain('truncated from')
+  })
+
+  it('the marker takes the key "[Trimmed]" when the user\'s one is among the keys it drops', () => {
+    const { lines, log, parsed } = limited({ maxRecordBytes: 2048 })
+    log((l) =>
+      l.info({
+        ...Object.fromEntries(Array.from({ length: 3000 }, (_, i) => [`k${i}`, i])),
+        '[Trimmed]': 'mine',
+      }),
+    )
+    expect(bytes(lines[0])).toBeLessThanOrEqual(2048)
+    const line = parsed()
+    expect(line['[Trimmed]']).toMatch(/^\[Trimmed: \d+ keys, \d+ bytes\]$/)
+    expect(line['[Trimmed]_']).toBeUndefined()
+    expect(lines[0]).not.toContain('"mine"')
+  })
+
   it('a message too large on its own is cut last, with the marker', () => {
     const { lines, log, parsed } = limited({ maxRecordBytes: 1024 })
     log((l) => l.error(new Error('e'.repeat(5000)), 'm'.repeat(5000)))
@@ -475,6 +558,70 @@ describe('limits.maxRecordBytes', () => {
       expect(line.service).toMatch(/…\[truncated from \d+ chars\]$/)
       expect(line.service).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/)
       expect(line.service).not.toMatch(/(?<![\ud800-\udbff])[\udc00-\udfff]/)
+    }
+  })
+
+  it('the last resort stays within the limit when the trace IDs and time are escaped characters', () => {
+    const control = '\u0001'.repeat(64) // 6 bytes each in JSON
+    const record = {
+      time: control,
+      level: 'INFO',
+      traceId: control,
+      spanId: control,
+      parentSpanId: control,
+    }
+    const line = fitLine(`{"time":"x","broken":${'['.repeat(5000)}`, record, 1024)
+    expect(bytes(line)).toBeLessThanOrEqual(1024)
+    // The trace IDs go first; time fits without them.
+    expect(JSON.parse(line)).toEqual({
+      time: control,
+      level: 'INFO',
+      logError: 'line over maxRecordBytes (1024)',
+    })
+  })
+
+  it('the last resort trims time and level to fit when nothing else can go', () => {
+    const control = '\u0001'.repeat(64)
+    const record = { time: control, level: '\u0001'.repeat(16), traceId: control }
+    const line = fitLine(`{"time":"x","broken":${'['.repeat(5000)}`, record, 200)
+    expect(bytes(line)).toBeLessThanOrEqual(200)
+    const parsed = JSON.parse(line)
+    expect(parsed.logError).toBe('line over maxRecordBytes (200)')
+    expect(parsed.traceId).toBeUndefined()
+    expect(parsed.time.length).toBeGreaterThan(0)
+    expect(control.startsWith(parsed.time)).toBe(true)
+    expect('\u0001'.repeat(16).startsWith(parsed.level)).toBe(true)
+  })
+
+  it('the last resort never gives message a second cut marker', () => {
+    const lines = _captureLines()
+    const logger = createLogger({
+      service: 's'.repeat(5000),
+      environment: 'e'.repeat(5000),
+      version: 'v'.repeat(5000),
+      limits: { maxStringLength: 300, maxRecordBytes: 1024 },
+    })
+    logger.info('m'.repeat(5000))
+    expect(bytes(lines[0])).toBeLessThanOrEqual(1024)
+    const { message } = JSON.parse(lines[0])
+    expect(message).toMatch(/^m+…\[truncated from 5000 chars\]$/)
+    expect(message.split('truncated from')).toHaveLength(2)
+    expect(message.length).toBeLessThan(300) // cut further than maxStringLength did
+  })
+
+  it('trimming message and err.message to fit keeps one cut marker, with the original length', () => {
+    const lines = _captureLines()
+    const logger = createLogger({
+      service: 's'.repeat(400),
+      limits: { maxStringLength: 500, maxRecordBytes: 1024 },
+    })
+    logger.error(new Error('e'.repeat(5000)), 'm'.repeat(5000))
+    expect(bytes(lines[0])).toBeLessThanOrEqual(1024)
+    const line = JSON.parse(lines[0])
+    expect(line.logError).toMatch(/only the Protected Fields/)
+    for (const text of [line.message, line.err.message]) {
+      expect(text).toMatch(/^[me]*…\[truncated from 5000 chars\]$/)
+      expect(text.split('truncated from')).toHaveLength(2)
     }
   })
 
@@ -560,14 +707,14 @@ describe('limits are bounded in time', () => {
   })
 
   it('doubling the line about doubles the time: linear, not quadratic', () => {
-    const small = trimTime(20_000)
-    const large = trimTime(80_000)
+    const small = trimTime(nestedFields(20_000))
+    const large = trimTime(nestedFields(80_000))
     expect(large / small).toBeLessThan(10) // 4x the size: quadratic would be ~16x
   }, 30_000)
 
   it('trimming the tail of a flat wide object is linear too: 4x the fields, under 10x the time', () => {
-    const small = tailTime(20_000)
-    const large = tailTime(80_000)
+    const small = trimTime(flatFields(20_000))
+    const large = trimTime(flatFields(80_000))
     expect(large / small).toBeLessThan(10)
   }, 30_000)
 

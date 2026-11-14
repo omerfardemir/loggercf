@@ -23,7 +23,7 @@ Imports come from exactly three entry points:
 - **Span**: a named, timed sub-operation, logged once as `span.end` when the trace is sampled: at its `level` (default `info`), or at `WARN` once it reaches its Slow Threshold `slowMs` (at its `level` instead, when that is more severe). A Span that throws is always logged at `ERROR`: as its `span.end`, or for an unsampled trace as one `<operation> failed` line.
 - **Span Fields**: fields that go on one Span's `span.end` line only (`fields` option, `span.set()`), never on other lines or into the Logging Context.
 - **Traced Session**: the RPC target a service binding's `session()` returns. Every method on it continues the caller's trace.
-- **Protected Fields**: what `limits.maxRecordBytes` keeps whole while anything else on a line can be trimmed: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, `err.type` and `err.message`.
+- **Protected Fields**: what `limits.maxRecordBytes` trims last, after everything else on a line: `time`, `level`, `message`, the trace IDs, `service`, `environment`, `version`, `err.type` and `err.message`.
 
 ## Pick the API by unit of work
 
