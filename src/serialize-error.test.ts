@@ -488,6 +488,14 @@ class ToJSONError extends Error {
   }
 }
 
+/** An `Error` whose class `toJSON` returns a string, which holds what the serializer leaves out. */
+class TextToJSONError extends Error {
+  body = 'user secret body'
+  toJSON() {
+    return `tj:${this.body}`
+  }
+}
+
 describe('an Error with a class toJSON, at any depth', () => {
   beforeEach(() => _reset())
 
@@ -534,6 +542,34 @@ describe('an Error with a class toJSON, at any depth', () => {
       b: { type: 'ToJSONError', message: 'deep', stack: expect.any(String), omitted: ['body'] },
     })
     expect(JSON.stringify(entries[0])).not.toContain('user secret body')
+  })
+
+  it('omitErrorKeys(["body"]) drops body when its toJSON returns a string, at depth 2', () => {
+    const entries = _captureEntries()
+    createLogger({ service: 'svc', serializeError: omitErrorKeys(['body']) }).info('m', {
+      a: { b: new TextToJSONError('deep') },
+      c: {
+        get d() {
+          return new TextToJSONError('got')
+        },
+      },
+    })
+    expect(entries[0].a).toEqual({
+      b: { type: 'TextToJSONError', message: 'deep', stack: expect.any(String), omitted: ['body'] },
+    })
+    expect(entries[0].c).toMatchObject({ d: { message: 'got', omitted: ['body'] } })
+    expect(JSON.stringify(entries[0])).not.toContain('user secret body')
+  })
+
+  it('%j and %o do not print it: it is routed and written by the serializer', () => {
+    const entries = _captureEntries()
+    const logger = createLogger({ service: 'svc', serializeError: omitErrorKeys(['body']) })
+    logger.info('v=%j', { a: { b: new ToJSONError('deep') } })
+    logger.info('v=%o', new TextToJSONError('top'))
+    expect(entries[0].message).toBe('v=%j')
+    expect(entries[1].message).toBe('v=%o')
+    expect(JSON.stringify(entries)).toContain('"omitted":["body"]')
+    expect(JSON.stringify(entries)).not.toContain('user secret body')
   })
 
   it('is the minimal shape on a line logged from inside the serializer, at depth 2', () => {

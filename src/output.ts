@@ -550,7 +550,7 @@ const thenableSerializers = new WeakMap<ErrorSerializer, string>()
  * Why a custom serializer's result can't be written, when it can't: anything
  * but an object, or a thenable (an `async` serializer). Its `Error` is then
  * written as if the serializer threw. A thenable also marks `serializer` as one
- * to call no more (see `skippedSerializer()`).
+ * to call no more (see `thenableFailure()`).
  *
  * @param {unknown} result - What the serializer returned.
  * @param {ErrorSerializer} serializer - The serializer that returned it.
@@ -577,7 +577,7 @@ export function invalidResult(result: unknown, serializer: ErrorSerializer): str
  * @param {ErrorSerializer} serializer - The serializer.
  * @returns {string | undefined} `serializeError returned a Promise` (or `a thenable`), or `undefined` when it may be called.
  */
-export const skippedSerializer = (serializer: ErrorSerializer): string | undefined =>
+export const thenableFailure = (serializer: ErrorSerializer): string | undefined =>
   thenableSerializers.get(serializer)
 
 /**
@@ -634,7 +634,7 @@ function shallowCopy(error: Error, cache: SerializedErrors): LogRecord {
 function customCopy(error: Error, custom: CustomErrors, cache: SerializedErrors): unknown {
   if (custom.copies.has(error)) return custom.copies.get(error)
   let copy: unknown
-  let failed = skippedSerializer(custom.serialize)
+  let failed = thenableFailure(custom.serialize)
   if (failed === undefined) {
     serializing++
     try {
@@ -1157,8 +1157,10 @@ function toJSONValue(value: unknown, key: string, walk: Walk, useToJSON = true):
   if (walk.ancestors.has(object)) return standIn(walk, '[Circular]')
 
   // Under a `serializeError` (or inside one) the serializer wins at every depth: an `Error` is
-  // written by it, not by its class's `toJSON`. Without one, nothing is checked but `walk.errors`.
-  if (useToJSON && !(walk.errors && serializerWins(walk.errors) && isError(object))) {
+  // written by it, not by its class's `toJSON`; and `%j` gives up at an `Error` before calling
+  // its `toJSON`, as it does at one without. Without either, nothing is checked but a field.
+  const errorFirst = walk.errors ? serializerWins(walk.errors) : walk.strict
+  if (useToJSON && !(errorFirst && isError(object))) {
     let toJSON: unknown
     try {
       toJSON = (object as { toJSON?: unknown }).toJSON
@@ -1504,6 +1506,15 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
       return JSON.stringify(record, function (this: unknown, key: string, value: unknown) {
         if (++values > MAX_FAST_VALUES) throw NEEDS_WALK
         chars += key.length
+        // Read through the descriptor, so a getter does not run twice.
+        let descriptor: PropertyDescriptor | undefined
+        if (errorsFirst) {
+          descriptor = Object.getOwnPropertyDescriptor(this, key)
+          // Native `JSON.stringify` already called its `toJSON`, whatever it returned: the walk
+          // writes the `Error` instead. A getter may have returned one.
+          if (descriptor?.get) throw NEEDS_WALK
+          if (descriptor?.value !== value && isError(descriptor?.value)) throw NEEDS_WALK
+        }
         const text = typeof value === 'string' ? value : nonJSONText(value)
         if (text !== undefined) {
           chars += text.length
@@ -1521,8 +1532,7 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
         if (typeof value !== 'object' || value === null) return value
         if (seen.has(value)) throw NEEDS_WALK
         seen.add(value)
-        // Read through the descriptor, so a getter does not run twice.
-        const descriptor = Object.getOwnPropertyDescriptor(this, key)
+        descriptor ??= Object.getOwnPropertyDescriptor(this, key)
         // A getter may return the same object every time: a repeat this path cannot see.
         if (descriptor?.get) throw NEEDS_WALK
         // A `toJSON` result: the object it was called on is what repeats, as in the walk.
@@ -1530,8 +1540,6 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
         if (own !== value && typeof own === 'object' && own !== null) {
           if (seen.has(own)) throw NEEDS_WALK
           seen.add(own)
-          // Native `JSON.stringify` already called its `toJSON`: the walk writes the `Error` instead.
-          if (errorsFirst && isError(own)) throw NEEDS_WALK
         }
         // A plain object or an array, as most are, is none of the values below.
         const prototype: unknown = Object.getPrototypeOf(value)

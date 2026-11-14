@@ -6,7 +6,7 @@ import {
   isError,
   isPlainObject,
   readEntries,
-  skippedSerializer,
+  thenableFailure,
 } from './output'
 
 /**
@@ -154,7 +154,7 @@ function omitting(keys: readonly string[], serializer?: ErrorSerializer): ErrorS
     const omittingDefault = (e: Error) =>
       e === err ? defaultSerialize(e) : without(e, defaultSerialize(e), defaultSerialize)
     // One that returned a thenable is not called again (see `thenableSerializers`).
-    let failed = skippedSerializer(serializer)
+    let failed = thenableFailure(serializer)
     if (failed === undefined) {
       try {
         const result = serializer(err, omittingDefault)
