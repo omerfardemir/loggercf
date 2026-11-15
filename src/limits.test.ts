@@ -96,6 +96,10 @@ const MULTI_MB: [string, () => Record<string, unknown>][] = [
     () => Object.fromEntries(Array.from({ length: 100_000 }, (_, i) => [`k${i}`, i])),
   ],
   ['1.6 MB of 60-byte fields', () => flatFields(23_000)],
+  [
+    '2.2 MB, an array of 100k small objects',
+    () => ({ list: Array.from({ length: 100_000 }, (_, i) => ({ i, s: 'ab' })) }),
+  ],
 ]
 
 /**
