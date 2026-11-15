@@ -1,5 +1,5 @@
 import type { ErrorSerializer, LogFields, Redactor, TraceContext } from './types'
-import { cutString, fitLine, PROTECTED_KEYS } from './limits'
+import { cutString, fitLine, fitValue, PROTECTED_KEYS } from './limits'
 
 /**
  * A finished log line, before serialization.
@@ -1073,6 +1073,12 @@ interface Walk {
   seen: Set<object>
   /** Every long string this walk wrote so far, outside repeats. */
   strings: Set<string>
+  /**
+   * How many items and keys the arrays and objects this walk wrote hold, in
+   * all: with `strings`, what tells a line is large before it is written
+   * (see `looksOver()`). Counted once per container, so it costs nothing per value.
+   */
+  entries: number
   /** What earlier walks of the same line wrote, which are repeats too. */
   earlier?: Written
   /** How many repeats the current value is nested in. */
@@ -1646,6 +1652,7 @@ function objectToJSONValue(object: object, walk: Walk): unknown {
     else if (Object.getPrototypeOf(object) !== Object.prototype) boxed = unbox(object)
     if (!items && !boxed) keys = Object.keys(object)
     length = items?.length ?? 0
+    walk.entries += keys ? keys.length : length
   } catch (thrown) {
     return unserializableToJSONValue(thrown, walk.path?.at(-1) ?? '', walk)
   }
@@ -1755,6 +1762,7 @@ const newWalk = (
   ancestors: new Set(),
   seen: new Set(),
   strings: new Set(),
+  entries: 0,
   earlier,
   inRepeat: 0,
   budget,
@@ -1800,7 +1808,8 @@ const MAX_FAST_CHARS = 1024 * 1024
  *
  * A record from a logger with `limits` has them applied here: a string
  * longer than `maxStringLength` is cut on either path, and a line larger
- * than `maxRecordBytes` is trimmed to fit (see `fitLine()`). Its Errors
+ * than `maxRecordBytes` is trimmed to fit: on the fast path read back from
+ * the line (see `fitLine()`), on the walk from its copy (see `writeCopy()`). Its Errors
  * are written by its logger's `serializeError`, when it has one. A record
  * from a logger with `redact` is redacted first (see `writeRedacted()`), so
  * the limits measure what is written.
@@ -1811,12 +1820,74 @@ const MAX_FAST_CHARS = 1024 * 1024
  */
 export function stringifyRecord(record: LogRecord): string {
   const options = (record as WithLineOptions)[LINE_OPTIONS]
-  const line = options?.redact
+  return options?.redact
     ? writeRedacted(record, options, options.redact)
     : writeRecord(record, options)
-  return options?.maxRecordBytes === undefined
-    ? line
-    : fitLine(line, record, options.maxRecordBytes)
+}
+
+/**
+ * A line, trimmed to its logger's `maxRecordBytes` when it has one (see
+ * `fitLine()`).
+ *
+ * @param {string} line - The JSON line.
+ * @param {LogRecord} record - The record it was written from.
+ * @param {LineOptions} [options] - Its logger's options.
+ * @returns {string} The line to write.
+ */
+const applyMaxRecordBytes = (
+  line: string,
+  record: LogRecord,
+  options: LineOptions | undefined,
+): string =>
+  options?.maxRecordBytes === undefined ? line : fitLine(line, record, options.maxRecordBytes)
+
+/**
+ * The walk's line of a record, trimmed to its logger's `maxRecordBytes` when
+ * it has one. The walk's JSON-ready copy is trimmed, never the line read back
+ * (see `fitValue()`). A copy known to be large (the fast path gave up on its
+ * size, or `looksOver()` says so) is measured before it is written, so a line
+ * over the limit is never written whole; any other is written first, and
+ * measured again only when it is over.
+ *
+ * @param {LogRecord} record - The record.
+ * @param {Walk} walk - The walk to write it with.
+ * @param {LineOptions | undefined} options - Its logger's options.
+ * @param {boolean} large - The fast path gave up on its size (see `MAX_FAST_VALUES`).
+ * @returns {string} The line to write.
+ */
+function writeCopy(
+  record: LogRecord,
+  walk: Walk,
+  options: LineOptions | undefined,
+  large: boolean,
+): string {
+  const copy = toJSONValue(record, '', walk, false) as LogRecord
+  if (options?.maxRecordBytes === undefined) return JSON.stringify(copy)
+  const max = options.maxRecordBytes
+  return large || looksOver(walk, max)
+    ? fitValue(copy, record, max)
+    : fitValue(copy, record, max, JSON.stringify(copy))
+}
+
+/**
+ * Whether a walk's line looks over `max` bytes, from what the walk counted
+ * as it went: each item or key of its containers takes 2 bytes or more (a
+ * value and a comma), and each long string (see `LONG_STRING`) its length.
+ * Near enough: a key whose value is `undefined` is left out of the line, and
+ * `maxStringLength` may have cut a long string, so a line that fits can look
+ * over. That only has it measured before it is written, which gives the same
+ * line. Free: the walk counts `entries` once per container, and keeps the
+ * long strings for its repeat rule.
+ *
+ * @param {Walk} walk - The walk.
+ * @param {number} max - `maxRecordBytes`.
+ * @returns {boolean} `true` when it looks over.
+ */
+function looksOver(walk: Walk, max: number): boolean {
+  let bytes = walk.entries * 2
+  if (bytes > max) return true
+  for (const text of walk.strings) if ((bytes += text.length) > max) return true
+  return false
 }
 
 /**
@@ -1831,10 +1902,15 @@ export function stringifyRecord(record: LogRecord): string {
  * @param {LogRecord} record - The record to serialize.
  * @param {LineOptions} options - Its logger's options.
  * @param {LineRedactor} redact - Its logger's redactor.
- * @returns {string} One JSON line, before `maxRecordBytes`.
+ * @returns {string} One JSON line, trimmed to `maxRecordBytes`.
  */
 function writeRedacted(record: LogRecord, options: LineOptions, redact: LineRedactor): string {
-  if (redacting > 0) return JSON.stringify(failedLine(record, REDACT_REENTERED))
+  if (redacting > 0)
+    return applyMaxRecordBytes(
+      JSON.stringify(failedLine(record, REDACT_REENTERED)),
+      record,
+      options,
+    )
   const budget = lineBudgets.get(record) ?? newBudget()
   const errors =
     (record as WithLineErrors)[LINE_ERRORS] ?? newSerializedErrors(options.serializeError)
@@ -1849,7 +1925,7 @@ function writeRedacted(record: LogRecord, options: LineOptions, redact: LineReda
       walk.maxString = maxString
       walk.record = record
     }
-    return JSON.stringify(toJSONValue(record, '', walk, false))
+    return writeCopy(record, walk, options, false)
   }
   // Built uncut: `record()` sees whole strings, and its result is cut once.
   walk.ordinary = true // `record()` is given objects it can call `hasOwnProperty` on
@@ -1937,9 +2013,10 @@ function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
 }
 
 /**
- * `stringifyRecord()` before `maxRecordBytes`: the line, with every string
+ * The line of a record no redactor walks (a logger without `redact`, or what
+ * a redactor's `record()` returned, see `writeRedacted()`), with every string
  * value longer than `maxStringLength` cut (see `cutString()`), but those
- * `keepsLength()` keeps.
+ * `keepsLength()` keeps, then trimmed to `maxRecordBytes`.
  *
  * @param {LogRecord} record - The record to serialize.
  * @param {LineOptions} [options] - Its logger's options.
@@ -1948,6 +2025,7 @@ function recordHook(copy: LogRecord, redact: LineRedactor): LogRecord {
 function writeRecord(record: LogRecord, options: LineOptions | undefined): string {
   const maxString = options?.maxStringLength ?? Infinity
   let texts: Map<unknown, string> | undefined // the record's, read at each BigInt until one is found
+  let large = false // the fast path gave up on the line's size, not on a value
   if (typeof record.toJSON !== 'function') {
     // Under a `serializeError` (or inside one) an `Error` is written before its `toJSON` is called.
     const errorsFirst = options?.serializeError !== undefined || serializing > 0
@@ -1955,8 +2033,9 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
     let strings: Set<string> | undefined
     let values = 0
     let chars = 0
+    let line: string | undefined
     try {
-      return JSON.stringify(record, function (this: unknown, key: string, value: unknown) {
+      line = JSON.stringify(record, function (this: unknown, key: string, value: unknown) {
         if (++values > MAX_FAST_VALUES) throw NEEDS_WALK
         chars += key.length
         // Read through the descriptor, so a getter does not run twice.
@@ -2022,7 +2101,10 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
       })
     } catch {
       // A repeat, a cycle, or a value that throws: the walk handles each one on its own.
+      large = values > MAX_FAST_VALUES || chars > MAX_FAST_CHARS
     }
+    // Out of the `try`: only the fast path's own throws hand the line to the walk.
+    if (line !== undefined) return applyMaxRecordBytes(line, record, options)
   }
   const budget = lineBudgets.get(record) ?? newBudget()
   const errors =
@@ -2034,7 +2116,7 @@ function writeRecord(record: LogRecord, options: LineOptions | undefined): strin
     walk.maxString = maxString
     walk.record = record
   }
-  return JSON.stringify(toJSONValue(record, '', walk, false))
+  return writeCopy(record, walk, options, large)
 }
 
 /** What `formatMessage()` and `routeArgs()` print a message with. */

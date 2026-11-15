@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { createLogger, runWithLogger, getLogger, _captureLines, _reset } from './logger'
 import { omitErrorKeys } from './omit'
-import { fitLine, utf8Bytes } from './limits'
+import { fitLine, fitValue, utf8Bytes } from './limits'
+import { redactKeys } from './redact'
 import type { LineLimits } from './types'
 
 const TRACEPARENT = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
@@ -73,6 +74,72 @@ function lastResortTime(n: number): number {
   const ms = Math.min(...Array.from({ length: 3 }, () => elapsed(run)))
   expect(bytes(lines.at(-1)!)).toBeLessThanOrEqual(1024)
   return ms
+}
+
+/**
+ * The multi-MB lines `maxRecordBytes` trims from the walk's copy: wide lines
+ * of short values (strings, numbers, keys), whose own walk is quick, so a
+ * measuring pass shows, and a long string.
+ */
+const MULTI_MB: [string, () => Record<string, unknown>][] = [
+  ['a 20 MB string', () => ({ s: 'x'.repeat(20_000_000) })],
+  [
+    '2.2 MB, an array of 100k short strings',
+    () => ({ list: Array.from({ length: 100_000 }, (_, i) => `item-${i}-zzzzzzzz`) }),
+  ],
+  [
+    '1.1 MB, an array of 150k numbers',
+    () => ({ list: Array.from({ length: 150_000 }, (_, i) => i * 7) }),
+  ],
+  [
+    '1.5 MB, 100k keys',
+    () => Object.fromEntries(Array.from({ length: 100_000 }, (_, i) => [`k${i}`, i])),
+  ],
+  ['1.6 MB of 60-byte fields', () => flatFields(23_000)],
+  [
+    '2.2 MB, an array of 100k small objects',
+    () => ({ list: Array.from({ length: 100_000 }, (_, i) => ({ i, s: 'ab' })) }),
+  ],
+]
+
+/**
+ * How long a line of `fields` takes trimmed to 16,384 bytes, over how long it
+ * takes written whole by the same logger without `limits`: the median of 9
+ * runs of each, taken in turn, so load on the machine slows both alike.
+ *
+ * @param {Record<string, unknown>} fields - The fields of the line.
+ * @param {boolean} redact - Whether both loggers have a redactor.
+ * @returns {number} The ratio.
+ */
+function trimRatio(fields: Record<string, unknown>, redact: boolean): number {
+  const lines = _captureLines()
+  const options = { service: 'svc', redact: redact && redactKeys(['password']) }
+  const whole = createLogger(options)
+  const trimmed = createLogger({ ...options, limits: { maxRecordBytes: 16_384 } })
+  const run = (logger: typeof whole) => elapsed(() => logger.info(fields, 'big'))
+  run(whole) // warm up
+  run(trimmed)
+  const times: [number[], number[]] = [[], []]
+  for (let i = 0; i < 9; i++) {
+    times[0].push(run(whole))
+    times[1].push(run(trimmed))
+  }
+  expect(bytes(lines.at(-1)!)).toBeLessThanOrEqual(16_384)
+  return median(times[1]) / median(times[0])
+}
+
+/**
+ * The middle of an odd number of times.
+ *
+ * @param {number[]} times - The times.
+ * @returns {number} Their median.
+ */
+const median = (times: number[]): number => {
+  const half = times.length >> 1
+  // The one with no more than half the others below it, and no more than half above.
+  return times.find(
+    (t) => times.filter((u) => u < t).length <= half && times.filter((u) => u > t).length <= half,
+  )!
 }
 
 /** A logger with `limits`, inside a Logging Context, and the lines it writes. */
@@ -635,6 +702,17 @@ describe('limits.maxRecordBytes', () => {
     expect(cut.endsWith(`…[truncated from ${text.length} chars]`)).toBe(true)
   })
 
+  it('a cut marker is found however many digits it holds, and only at the end', () => {
+    const lines = _captureLines()
+    const logger = createLogger({ service: 's', limits: { maxRecordBytes: 1024 } })
+    const many = `${'x'.repeat(5000)}…[truncated from ${'9'.repeat(60)} chars]`
+    const twice = `${'y'.repeat(5000)}…[truncated from 9000 chars]…[truncated from 7000 chars]`
+    logger.info({ a: many }, 'm')
+    logger.info({ b: twice }, 'm')
+    expect(JSON.parse(lines[0]).a).toMatch(/^x+…\[truncated from 1e\+60 chars\]$/)
+    expect(JSON.parse(lines[1]).b).toMatch(/^y+…\[truncated from 7000 chars\]$/)
+  })
+
   it('works with maxStringLength and omitErrorKeys together', () => {
     const lines = _captureLines()
     const logger = createLogger({
@@ -687,6 +765,273 @@ describe('limits.maxRecordBytes', () => {
   })
 })
 
+/**
+ * `value` as the walk of `output.ts` copies it: each object without a prototype.
+ *
+ * @param {unknown} value - A JSON-ready value.
+ * @returns {unknown} The copy.
+ */
+function walkCopy(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(walkCopy)
+  if (typeof value !== 'object' || value === null) return value
+  const out = Object.create(null) as Record<string, unknown>
+  for (const [key, item] of Object.entries(value)) out[key] = walkCopy(item)
+  return out
+}
+
+/** Records of every shape the trimming takes a path for, each built fresh: trimming mutates a copy. */
+const SHAPES: [string, () => Record<string, unknown>][] = [
+  ['many small fields', () => flatFields(5_000)],
+  ['nested small objects', () => nestedFields(3_000)],
+  [
+    'large, medium and small values',
+    () => ({
+      small: 'keep me',
+      medium: 'm'.repeat(1500),
+      big: { rows: Array.from({ length: 500 }, (_, i) => ({ i, name: `row ${i}` })) },
+      text: 't'.repeat(30_000),
+      again: 't'.repeat(30_000),
+    }),
+  ],
+  ['a wide array of small items', () => ({ list: Array.from({ length: 20_000 }, (_, i) => i) })],
+  [
+    'a wide array of large and small items',
+    () => ({
+      list: Array.from({ length: 2_000 }, (_, i) => (i % 7 === 0 ? 'L'.repeat(300 + i) : i)),
+    }),
+  ],
+  [
+    'a wide object of large and small values',
+    () =>
+      Object.fromEntries(
+        Array.from({ length: 2_000 }, (_, i) => [`k${i}`, i % 5 === 0 ? 'v'.repeat(200) : i]),
+      ),
+  ],
+  [
+    'an err with many fields',
+    () => ({
+      err: {
+        type: 'Error',
+        message: 'boom',
+        stack: 's'.repeat(8000),
+        ...Object.fromEntries(Array.from({ length: 3_000 }, (_, i) => [`p${i}`, sixtyBytes(i)])),
+      },
+    }),
+  ],
+  [
+    'multi-byte text, escapes and emoji',
+    () => ({
+      cjk: '漢字'.repeat(3000),
+      emoji: '😀'.repeat(2000),
+      escapes: '"\\\n\t\u0001'.repeat(1000),
+      lone: '\ud800x'.repeat(1000),
+      ...Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`ключ${i}😀`, `значение ${i}`])),
+    }),
+  ],
+  [
+    'cut markers, real and not',
+    () => ({
+      cut: `${'c'.repeat(9000)}…[truncated from 20000 chars]`,
+      fake: `${'f'.repeat(9000)}…[truncated from 5 chars]`,
+    }),
+  ],
+  [
+    'keys like the marker, and integer keys',
+    () => ({
+      '[Trimmed]': 'mine',
+      '[Trimmed]_': 'mine too',
+      ...Object.fromEntries(Array.from({ length: 3_000 }, (_, i) => [String(i), sixtyBytes(i)])),
+    }),
+  ],
+  [
+    'numbers of every length: integers up to 1e21 and past it, fractions, negatives',
+    () => ({
+      list: Array.from({ length: 3_000 }, (_, i) => {
+        const n = [10 ** (i % 23), 10 ** (i % 23) - 1, 1.5 * 10 ** (i % 30), 2 ** (i % 70), 5e-324]
+        return (i % 2 ? -1 : 1) * n[i % 5]
+      }),
+    }),
+  ],
+  [
+    'numbers JSON writes as null, and -0',
+    () => ({
+      list: Array.from({ length: 3_000 }, (_, i) => [NaN, Infinity, -Infinity, -0, i / 7][i % 5]),
+    }),
+  ],
+  ['a message too large on its own', () => ({ message: 'm'.repeat(50_000) })],
+  [
+    'Protected Fields too large on their own',
+    () => ({
+      service: 's'.repeat(20_000),
+      version: 'v'.repeat(20_000),
+      message: 'm'.repeat(20_000),
+      err: { type: 'T'.repeat(20_000), message: 'e'.repeat(20_000) },
+    }),
+  ],
+]
+
+/**
+ * A record of `fields`, after Protected Fields: `time`, `level`, `message`, the trace IDs and `service`.
+ *
+ * @param {Record<string, unknown>} fields - The fields.
+ * @returns {Record<string, unknown>} The record.
+ */
+const record = (fields: Record<string, unknown>): Record<string, unknown> => ({
+  time: '2026-01-01T00:00:00.000Z',
+  level: 'INFO',
+  message: 'm',
+  traceId: '0af7651916cd43dd8448eb211c80319c',
+  spanId: 'b7ad6b7169203331',
+  service: 'svc',
+  ...fields,
+})
+
+/** An object written twice on a line: a repeat, which the fast path hands to the walk. */
+const SHARED = { shared: true }
+
+/** Lines that take each path of `stringifyRecord()`, and whether their loggers redact. */
+const PATHS: [string, () => Record<string, unknown>, boolean][] = [
+  ['the fast path', () => ({ rows: nestedFields(500) }), false],
+  ['the walk, for a repeat', () => ({ a: nestedFields(500), b: 'x', c: SHARED, d: SHARED }), false],
+  ['the walk, for an Error', () => ({ ctx: new Error('inner'), rows: nestedFields(500) }), false],
+  ['the walk, for its size', () => ({ s: 'x'.repeat(1_200_000), rows: nestedFields(200) }), false],
+  // At 16,384 bytes written before it is measured: what the walk counted is under the limit.
+  ['the walk, with a redactor', () => ({ password: 'p', rows: nestedFields(500) }), true],
+  // Measured before it is written: it holds more items than the limit has bytes for.
+  [
+    'the walk, with a redactor, many short values',
+    () => ({ password: 'p', list: Array.from({ length: 20_000 }, (_, i) => i) }),
+    true,
+  ],
+  [
+    'the walk, for an Error, many short strings',
+    () => ({ ctx: new Error('inner'), list: Array.from({ length: 20_000 }, (_, i) => `s${i}`) }),
+    false,
+  ],
+  // Measured before it is written: its long strings alone are over the limit.
+  [
+    'the walk, with a redactor, for a long string',
+    () => ({ password: 'p', s: 'x'.repeat(30_000), more: 'y'.repeat(2_000) }),
+    true,
+  ],
+  [
+    'the walk, for a repeat and a long string',
+    () => ({ c: SHARED, d: SHARED, s: 'x'.repeat(30_000) }),
+    false,
+  ],
+  [
+    'the walk, with a redactor, multi-byte',
+    () => ({ password: 'p', cjk: '漢'.repeat(6000) }),
+    true,
+  ],
+]
+
+/**
+ * One line of `fields` from a logger with `limits`, and the same line from one without.
+ *
+ * @param {Record<string, unknown>} fields - The fields.
+ * @param {LineLimits} limits - The limits.
+ * @param {boolean} redact - Whether the loggers redact `password`.
+ * @returns {[string, string]} The line with limits, and the line without.
+ */
+function both(
+  fields: Record<string, unknown>,
+  limits: LineLimits,
+  redact: boolean,
+): [string, string] {
+  const lines = _captureLines()
+  for (const options of [{ limits }, {}]) {
+    const logger = createLogger(
+      { service: 'svc', ...options, redact: redact && redactKeys(['password']) },
+      { region: 'eu' },
+    )
+    runWithLogger({ logger, traceparent: TRACEPARENT }, () => getLogger().info(fields, 'm'))
+  }
+  return [lines[0], lines[1]]
+}
+
+describe("limits.maxRecordBytes on the walk's copy", () => {
+  beforeEach(() => _reset())
+
+  it.each(SHAPES)('trims the copy to the line fitLine gives its line read back: %s', (_, shape) => {
+    for (const max of [1024, 4096, 16_384, 100_000]) {
+      const line = JSON.stringify(record(shape()))
+      const expected = fitLine(line, record(shape()), max)
+      const copy = () => walkCopy(record(shape())) as Record<string, unknown>
+      expect({ max, line: fitValue(copy(), record(shape()), max) }).toEqual({ max, line: expected })
+      expect({ max, line: fitValue(copy(), record(shape()), max, line) }).toEqual({
+        max,
+        line: expected,
+      })
+      expect(bytes(expected)).toBeLessThanOrEqual(max)
+    }
+  })
+
+  it('the same line at every limit, when a wide container loses a large value and then its tail', () => {
+    // At some limits the large value's marker saves a few bytes too few, and the tail goes too.
+    const shapes = [
+      () => ({ list: [...Array.from({ length: 300 }, (_, i) => i), { s: 'x'.repeat(2000) }] }),
+      () => ({ ...flatFields(300), last: { s: 'x'.repeat(2000) } }),
+    ]
+    for (const shape of shapes)
+      for (let max = 1024; max <= 4096; max++) {
+        const expected = fitLine(JSON.stringify(record(shape())), {}, max)
+        expect(fitValue(walkCopy(record(shape())) as Record<string, unknown>, {}, max)).toBe(
+          expected,
+        )
+        // The tail is measured as it is now, marker included: so it fits without falling back.
+        expect(expected).not.toContain('logError')
+        expect(bytes(expected)).toBeLessThanOrEqual(max)
+      }
+  })
+
+  it('a dropped tail is measured to the byte: its marker holds what the dropped items took', () => {
+    const items = Array.from(
+      { length: 3_000 },
+      (_, i) => [i, -i * 1001, 10 ** (i % 22), i / 3, `s${i}`, -0, NaN][i % 7],
+    )
+    for (let max = 1024; max <= 8192; max += 97) {
+      const line = fitValue({ list: [...items] }, {}, max)
+      const list = (JSON.parse(line) as { list: unknown[] }).list
+      const kept = list.length - 1
+      const dropped = items.slice(kept)
+      const taken = dropped.reduce((sum: number, item) => sum + JSON.stringify(item).length, 0)
+      expect(list.at(-1)).toBe(`[Trimmed: ${dropped.length} items, ${taken} bytes]`)
+      expect(bytes(line)).toBeLessThanOrEqual(max)
+      // As many leading items as fit: one more, and the line would be over.
+      const more = `${JSON.stringify(items[kept])},`
+      expect(bytes(line) + bytes(more)).toBeGreaterThan(max)
+    }
+  })
+
+  it.each(SHAPES)('writes a copy that fits as JSON.stringify does: %s', (_, shape) => {
+    const line = JSON.stringify(record(shape()))
+    const max = Math.max(1024, bytes(line))
+    expect(fitValue(walkCopy(record(shape())) as Record<string, unknown>, {}, max)).toBe(line)
+  })
+
+  it.each(PATHS)(
+    'a line under the limit is byte for byte the line without limits: %s',
+    (_, fields, redact) => {
+      const [withLimits, without] = both(fields(), { maxRecordBytes: 50_000_000 }, redact)
+      expect(strip(withLimits)).toBe(strip(without))
+    },
+  )
+
+  it.each(PATHS)(
+    'a line over the limit is what fitLine makes of the line without limits: %s',
+    (_, fields, redact) => {
+      for (const max of [1024, 16_384]) {
+        const [withLimits, without] = both(fields(), { maxRecordBytes: max }, redact)
+        expect({ max, line: strip(withLimits) }).toEqual({
+          max,
+          line: strip(fitLine(without, {}, max)),
+        })
+      }
+    },
+  )
+})
+
 describe('limits are bounded in time', () => {
   beforeEach(() => _reset())
 
@@ -731,4 +1076,19 @@ describe('limits are bounded in time', () => {
   it('the last resort is linear too: 4x the text, under 10x the time', () => {
     expect(lastResortTime(2_000_000) / lastResortTime(500_000)).toBeLessThan(10)
   }, 30_000)
+
+  // Written whole and read back, these took 1.3x to 3.3x as long; now 0.9x to 1.2x. Under load a
+  // run can go over, so a failing one is measured again: a real regression stays over.
+  it.each(
+    MULTI_MB.flatMap(([name, fields]) => [
+      [name, fields, false],
+      [`${name}, redacted`, fields, true],
+    ]) as [string, () => Record<string, unknown>, boolean][],
+  )(
+    'an oversized multi-MB line costs at most about 1.2x what writing it whole does: %s',
+    { timeout: 60_000, retry: 2 },
+    (_, fields, redact) => {
+      expect(trimRatio(fields(), redact)).toBeLessThan(1.25)
+    },
+  )
 })
