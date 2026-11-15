@@ -1,6 +1,6 @@
 {
   "name": "loggercf",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Structured logging and trace propagation for Cloudflare Workers and Node.js.",
   "homepage": "https://github.com/omerfardemir/loggercf#readme",
   "bugs": {
