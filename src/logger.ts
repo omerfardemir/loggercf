@@ -1017,6 +1017,30 @@ export function getContextField(key: string): LogValue | undefined {
 }
 
 /**
+ * The current Logging Context's fields, for your own logger to put on its lines:
+ * the Context Fields (`requestId`, `userId`, ...), then `traceId`, `spanId` and
+ * `parentSpanId` (left out of a root trace). The trace IDs win over a Context Field
+ * of the same name. A new object each call: changing it changes nothing.
+ *
+ * loggercf's own loggers already write these on every line. Use it where another
+ * logger asks for per-line fields: pino's `mixin`, a winston format, a consola reporter.
+ *
+ * @returns {LogFields} The fields, or `{}` outside a Logging Context.
+ *
+ * @example
+ * ```ts
+ * const logger = pino({ mixin: currentContextFields })
+ * ```
+ */
+export function currentContextFields(): LogFields {
+  const store = als.getStore()
+  if (!store) return {}
+  const fields: LogFields = { ...store.fields }
+  applyTrace(fields, store.trace)
+  return fields
+}
+
+/**
  * Replace the sink that receives finished records. Returns the previous sink.
  *
  * @internal Test seam, not exported from the package entry points.

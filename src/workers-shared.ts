@@ -43,27 +43,115 @@ export interface RootLoggerSource<E = unknown> {
    * for the same keys, even inline).
    */
   redact?: Redactor | false
+  /**
+   * Your own Root Logger, in place of the one loggercf builds from env: any `Logger`
+   * (a pino logger as it is, winston or consola through their adapters, or
+   * `adaptLogger()`), or a function of env that returns one, called once per env.
+   * Every line of the helper's Logging Contexts, loggercf's own included, is written
+   * through it, and it becomes the Default Logger unless one is already set. `env`,
+   * `serializeError` and `redact` configure the logger loggercf builds, so passing
+   * one of them with it throws: configure your own logger instead.
+   */
+  logger?: Logger | ((env: E) => Logger)
 }
 
 /** The code-only Logger Options of a helper's options: all but the Env Mapping. */
 export type CodeOptions = Pick<RootLoggerSource, 'serializeError' | 'redact'>
 
+/** The level methods every Root Logger has. */
+const LOGGER_METHODS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'child'] as const
+
 /**
- * A helper's Root Logger source: the `env`, `serializeError` and `redact` of its
- * options, and nothing else. One place to list them, for every helper.
+ * Check that `logger` is a `Logger`: its six level methods and `child`.
+ *
+ * @param {unknown} logger - Your own Root Logger.
+ * @param {string} where - The helper call, for the error message.
+ * @returns {Logger} `logger`.
+ * @throws {TypeError} Naming the methods it lacks.
+ */
+export function checkLogger(logger: unknown, where: string): Logger {
+  const missing =
+    typeof logger === 'object' && logger !== null
+      ? LOGGER_METHODS.filter(
+          (name) => typeof (logger as Record<string, unknown>)[name] !== 'function',
+        )
+      : LOGGER_METHODS
+  if (missing.length > 0) {
+    throw new TypeError(
+      `${where}: logger must be a Logger (trace, debug, info, warn, error, fatal and child) or a function of env that returns one; it has no ${missing.join(', ')}. Wrap winston or consola with their adapter, or any other logger with adaptLogger()`,
+    )
+  }
+  return logger as Logger
+}
+
+/**
+ * A helper's Root Logger source: the `env`, `serializeError`, `redact` and `logger` of
+ * its options, and nothing else. One place to list them, for every helper.
  *
  * @param {RootLoggerSource<E>} options - A helper's options.
+ * @param {string} [where] - The helper call, for error messages (`withScheduled()`).
  * @returns {RootLoggerSource<E>} Its Root Logger source.
+ * @throws {TypeError} When `logger` is given with `env`, `serializeError` or `redact`, or is not a `Logger` or a function.
  */
-export function rootLoggerSource<E>(options: RootLoggerSource<E>): RootLoggerSource<E> {
-  const { env, serializeError, redact } = options
-  return { env, serializeError, redact }
+export function rootLoggerSource<E>(
+  options: RootLoggerSource<E>,
+  where = 'loggercf',
+): RootLoggerSource<E> {
+  const { env, serializeError, redact, logger } = options
+  if (logger === undefined) return { env, serializeError, redact }
+  const extra = (
+    [
+      ['env', env],
+      ['serializeError', serializeError],
+      ['redact', redact || undefined],
+    ] as const
+  ).filter(([, value]) => value !== undefined)
+  if (extra.length > 0) {
+    throw new TypeError(
+      `${where}: logger is your own Root Logger, so ${extra.map(([name]) => name).join(', ')} can't be passed with it; configure your logger instead`,
+    )
+  }
+  if (typeof logger !== 'function') checkLogger(logger, where)
+  return { logger }
+}
+
+/**
+ * The Root Logger each function of env returned, by the function, then by env, so
+ * it is called once per env (once per isolate, in a Worker).
+ */
+let ownLoggers = new WeakMap<Function, WeakMap<object, Logger>>()
+
+/**
+ * Your own Root Logger from a helper's `logger` option, for `env`.
+ *
+ * @param {Logger | ((env: any) => Logger)} logger - The `logger` option.
+ * @param {unknown} env - The Worker's env.
+ * @param {string} [where] - The helper call, for the error message.
+ * @returns {Logger} The Root Logger.
+ * @throws {TypeError} When the function returns something that is not a `Logger`.
+ */
+export function ownRootLogger(
+  logger: Logger | ((env: any) => Logger),
+  env: unknown,
+  where = 'loggercf',
+): Logger {
+  if (typeof logger !== 'function') return logger
+  const byEnv = typeof env === 'object' && env !== null ? env : undefined
+  let forFunction = ownLoggers.get(logger)
+  const cached = byEnv && forFunction?.get(byEnv)
+  if (cached) return cached
+  const made = checkLogger(logger(env), where)
+  if (byEnv) {
+    if (!forFunction) ownLoggers.set(logger, (forFunction = new WeakMap()))
+    forFunction.set(byEnv, made)
+  }
+  return made
 }
 
 /**
  * Whether two helpers' Root Logger sources are the same: the same Env Mapping
- * (see `sameEnvMapping()`), the same `serializeError` function and the same
- * `redact` object (`false` and absent are the same).
+ * (see `sameEnvMapping()`), the same `serializeError` function, the same
+ * `redact` object (`false` and absent are the same) and the same `logger`.
  *
  * @param {RootLoggerSource<any>} a - One helper's options.
  * @param {RootLoggerSource<any>} b - The other's.
@@ -73,7 +161,8 @@ export function sameRootLoggerSource(a: RootLoggerSource<any>, b: RootLoggerSour
   return (
     sameEnvMapping(a.env, b.env) &&
     a.serializeError === b.serializeError &&
-    (a.redact || undefined) === (b.redact || undefined)
+    (a.redact || undefined) === (b.redact || undefined) &&
+    a.logger === b.logger
   )
 }
 
@@ -189,19 +278,22 @@ export function cachedRootLogger(options: LoggerOptions): Logger {
 /** Test only: forget every cached Root Logger and the code-only option counts. */
 export function _resetRootLoggers(): void {
   rootLoggers = new WeakMap()
+  ownLoggers = new WeakMap()
   codeSeen = { serializeError: new WeakSet(), redact: new WeakSet() }
   codeCounts = { serializeError: 0, redact: 0 }
 }
 
 /**
  * The isolate's cached Root Logger for a Worker env, read through a helper's
- * Env Mapping, with the code-only options it was given.
+ * Env Mapping, with the code-only options it was given; or, when the helper was
+ * given its own `logger`, that one.
  *
  * @param {unknown} env - The Worker's env.
- * @param {RootLoggerSource<any>} [source] - The helper's `env`, `serializeError` and `redact` options.
- * @returns {Logger} The cached Root Logger.
+ * @param {RootLoggerSource<any>} [source] - The helper's `env`, `serializeError`, `redact` and `logger` options.
+ * @returns {Logger} The Root Logger.
  */
 export function envRootLogger(env: unknown, source: RootLoggerSource<any> = {}): Logger {
+  if (source.logger !== undefined) return ownRootLogger(source.logger, env)
   return cachedRootLogger(withCodeOptions(loggerOptionsFromEnv(env, source.env), source))
 }
 

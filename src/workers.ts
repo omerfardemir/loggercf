@@ -16,6 +16,7 @@ import {
   cachedRootLogger,
   defineMethod,
   envRootLogger,
+  ownRootLogger,
   prototypeMethods,
   registerRootLogger,
   runLogged,
@@ -384,6 +385,7 @@ export function tracedWorker<S extends TracedSession>(
     fetch(request: Request): Response | Promise<Response>
   }
 } {
+  const { logger } = rootLoggerSource(options, 'tracedWorker()')
   const mapping: EnvMapping<SessionEnv<S>> = options.env ?? {}
   const { serializeError, redact } = options
   return class extends TracedEntrypoint<SessionEnv<S>> {
@@ -395,6 +397,11 @@ export function tracedWorker<S extends TracedSession>(
     /** The options from env, with the closed-over `serializeError` and `redact`. */
     protected override get [LOGGER_OPTIONS](): LoggerOptions {
       return withCodeOptions(super[LOGGER_OPTIONS], { serializeError, redact })
+    }
+
+    /** Your own Root Logger when `options.logger` is given, else the one from env. */
+    protected override get [ROOT_LOGGER](): Logger {
+      return logger ? ownRootLogger(logger, this.env, 'tracedWorker()') : super[ROOT_LOGGER]
     }
 
     /**
@@ -741,6 +748,7 @@ export function withLogging<C extends EntrypointClass | DurableObjectSubclass>(
     env: mapping,
     serializeError,
     redact,
+    logger,
   } = options
   const entrypoint = Class.name
   const where = `withLogging(${entrypoint})`
@@ -779,8 +787,13 @@ export function withLogging<C extends EntrypointClass | DurableObjectSubclass>(
       )
     }
   }
+  if (isTracedEntrypoint && logger) {
+    throw new TypeError(
+      `${where}: ${entrypoint} is a TracedEntrypoint; override its [TracedEntrypoint.rootLogger] getter instead of passing logger`,
+    )
+  }
 
-  const source = rootLoggerSource<any>(options)
+  const source = rootLoggerSource<any>(options, where)
 
   /**
    * The Root Logger for one wrapped instance (an entrypoint or a Durable Object): its own
@@ -940,6 +953,7 @@ export function withLogging<C extends EntrypointClass | DurableObjectSubclass>(
     env: mapping,
     serializeError,
     redact,
+    logger,
   })
   return Logged as unknown as C
 }

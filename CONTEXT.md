@@ -81,6 +81,18 @@ _Avoid_: Record Keys, Moved Keys, Owned Keys (each is another rule)
 The `redact` Logger Option, off by default: hides values on a Root Logger's lines. Its `value(value, path)` is called for each value of the finished line (after Argument Routing and Error serialization, so inside every `Error` at any depth), before what is inside it, and returns what to write: the value, or a replacement that is not redacted again. Its `record(record)` gets the whole line once, after. It never sees the top-level `time`, `level` or trace IDs, and it runs before the Line Limits, so they measure what is written. What it returns is serialized like any value. It is user code: a `value()` that throws writes that value as `"[Redaction failed: <name>]"`, a `record()` that throws, or returns anything but a plain object, writes only `time`, `level`, the trace IDs and `redactFailed` (it fails closed), each with one WARN per isolate, and a line logged while it runs keeps only the same. Falsy `redact` is off. `redactKeys(keys)` builds one that replaces the whole value under any of the given keys (a `Map` entry's included), in any case, at any depth, the same object for the same keys; loggercf has no list of its own. Code, so no var turns it on or off: it is chosen per environment in code, and the Workers helpers cache their Root Logger by its identity.
 _Avoid_: scrubber, sanitizer, masking. Not to be confused with the Error Serializer, which shapes Errors (`omitErrorKeys` leaves keys out of them).
 
+**Your Own Logger**:
+A logger other than loggercf's built-in one (pino, winston, consola, or any other) used as the Root Logger: passed to `useLogger`, `runWithLogger`, a `TracedEntrypoint`'s Root Logger hook, or a Workers helper's `logger` option. Every line of its Logging Contexts is written through it, loggercf's own (Request Lines, `span.end`, failure lines) included, so they share its sink and format. It must answer the Logger Port. The Logger Options (the Span Defaults, the Error Serializer, the Line Limits, the Redactor) configure the built-in core and don't apply to it, and its lines carry the Context Fields and trace IDs only where it adds `currentContextFields()` (pino's `mixin`, a winston format, the consola adapter).
+_Avoid_: custom logger, external logger, third-party logger
+
+**Logger Port**:
+What loggercf calls on a Root Logger: the six level methods, as `(fields, message, ...args)` with `printf` placeholders in the message (`'span.end %s'`) or as `(message)`, and `child(bindings)`. It is loggercf's `Logger` interface. A pino logger answers it as it is; winston and consola answer it through their adapters (`loggercf/winston`, `loggercf/consola`), and any other logger through `adaptLogger()`.
+_Avoid_: logger interface, logger contract
+
+**Line Target**:
+What `adaptLogger()` writes through: a `write(line)` that gets each log call after Argument Routing (`level`, the formatted `message`, and `fields` with `err`, `errors` and `args`, nothing serialized), and an optional `child(bindings)`. Without `child`, the adapted logger keeps the bindings itself and writes them in `fields`.
+_Avoid_: sink (where the built-in core writes its finished lines), transport
+
 **Entrypoint Hook**:
 One of the three getters a `TracedEntrypoint` subclass overrides to supply its Env Mapping, Logger Options or Root Logger, keyed by the symbols `TracedEntrypoint.envMapping`, `.loggerOptions` and `.rootLogger`. Symbol-keyed so they stay off the entrypoint's RPC surface: a caller holding its Service Binding reaches only the string-keyed methods and getters the subclass declares.
 _Avoid_: config getter

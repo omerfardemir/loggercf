@@ -97,7 +97,7 @@ export function withScheduled<E = Cloudflare.Env, R = void | Promise<void>>(
   handler: (controller: ScheduledController, env: E, ctx: ExecutionContext) => R,
   options: HandlerOptions<E> = {},
 ): (controller: ScheduledController, env: E, ctx: ExecutionContext) => R {
-  const source = rootLoggerSource(options)
+  const source = rootLoggerSource(options, 'withScheduled()')
   return function scheduled(this: unknown, controller, env, ctx) {
     return runLogged(
       {
@@ -170,7 +170,7 @@ export function withQueueMessage<R, E = Cloudflare.Env>(
 ): R {
   return runLogged(
     {
-      logger: registeredEnvRootLogger(workersEnv, options),
+      logger: registeredEnvRootLogger(workersEnv, rootLoggerSource(options, 'withQueueMessage()')),
       ...carrierFromBody(message.body),
       fields: { queue: batch.queue, messageId: message.id, attempts: message.attempts },
     },
@@ -263,7 +263,7 @@ export function withWorkflow<C extends WorkflowClass>(
     )
   }
 
-  const source = rootLoggerSource<any>(options)
+  const source = rootLoggerSource<any>(options, where)
   /** The Root Logger for one Workflow instance, from its env. */
   const instanceRootLogger = (target: object) =>
     envRootLogger((target as { env: unknown }).env, source)

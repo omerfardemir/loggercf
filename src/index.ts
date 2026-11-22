@@ -24,7 +24,10 @@ export {
   setLoggerContext,
   getTraceContext,
   getTraceCarrier,
+  currentContextFields,
 } from './logger'
+export { adaptLogger } from './adapt'
+export type { LineTarget, LogLine } from './adapt'
 export { omitErrorKeys } from './omit'
 export { redactKeys } from './redact'
 export { tracedFetch, tracedFetcher } from './fetch'
