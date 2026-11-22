@@ -590,7 +590,7 @@ export default tracedWorker(MySession)
 
 ### `tracedWorker(SessionClass, options?)`
 
-Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class. `options.serializeError` and `options.redact` are the Root Logger's [`serializeError`](#errors-and-size-limits) and [`redact`](#redaction).
+Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class. `options.serializeError` and `options.redact` are the Root Logger's [`serializeError`](#errors-and-size-limits) and [`redact`](#redaction). `options.logger` is [your own Root Logger](#your-own-logger-pino-winston-consola) instead of the one built from env.
 
 ```ts
 // This is your entire worker export:
@@ -751,7 +751,7 @@ class SearchWorker extends WorkerEntrypoint<Env> {
 export default withLogging(SearchWorker, { spans: true })
 ```
 
-- Each RPC method call, and `fetch`, gets its own Logging Context from the isolate's Root Logger, built with `loggerOptionsFromEnv(this.env, options.env)` and shared with `TracedEntrypoint` and `tracedWorker`. Every line in it carries the Context Fields `rpcMethod` (the method name) and `entrypoint` (the class name).
+- Each RPC method call, and `fetch`, gets its own Logging Context from the isolate's Root Logger, built with `loggerOptionsFromEnv(this.env, options.env)` and shared with `TracedEntrypoint` and `tracedWorker`, or [your own](#your-own-logger-pino-winston-consola) from `options.logger`. Every line in it carries the Context Fields `rpcMethod` (the method name) and `entrypoint` (the class name).
 - A plain RPC call carries no Trace Carrier, so each call starts a new root trace. `fetch` continues an incoming `traceparent` header.
 - If `fetch` hands the request to a Hono app that uses `useLogger` (`fetch(req) { return app.fetch(req, this.env, this.ctx) }`), pass `fetch: false`. `useLogger` opens its own Logging Context and continues `traceparent` itself; with `fetch` wrapped as well, one request is split into two root traces. With `fetch: false`, `fetch` is inherited unchanged and the RPC methods are still wrapped.
 - A method called while any Logging Context is active joins that context, as a child Span when `spans` is on, and adds no `rpcMethod` or `entrypoint` of its own. That covers a public method called from another one (`this.normalize(q)`) and a call made inside another helper's context (from a [`withScheduled`](#withscheduledhandler-options) handler, say). Inside another method's context, its lines keep the caller's `rpcMethod`: when `nested()` calls `this.search()`, the child Span is `X.search`, but every line in it says `rpcMethod: 'nested'`.
@@ -760,8 +760,8 @@ export default withLogging(SearchWorker, { spans: true })
 - `entrypoint` is the class's `name`. A build that minifies class names changes it. An anonymous class (`withLogging(class extends WorkerEntrypoint { ... })`) gets no `entrypoint` field, and its Spans are named by the method alone.
 - Only the methods the class has when it is wrapped are wrapped. Put every RPC method on the class before wrapping it. A method added or overridden in a subclass of the wrapped class (`class Ext extends withLogging(A) { extra() {} }`) runs outside every Logging Context, so extend the wrapped class only to add handlers.
 - The class must extend `WorkerEntrypoint` or `DurableObject` (see [Durable Objects](#durable-objects)). Wrapping anything else throws.
-- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env`, `serializeError` or `redact` as well throws; override `[TracedEntrypoint.envMapping]` or `[TracedEntrypoint.loggerOptions]` instead.
-- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch`, `env`, `serializeError` and `redact`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
+- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env`, `serializeError`, `redact` or `logger` as well throws; override `[TracedEntrypoint.envMapping]`, `[TracedEntrypoint.loggerOptions]` or `[TracedEntrypoint.rootLogger]` instead.
+- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch`, `env`, `serializeError`, `redact` and `logger`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
 - With `session: true`, a field the caller passes named `rpcMethod` or `entrypoint` is replaced by the receiver's.
 - Only method calls are wrapped. A method named like a handler (`trace`, `test`, `email`, `connect`, `queue`, `tail` or `tailStream`) is never wrapped. These run outside the Logging Context: a getter read over RPC, and the body of an `async *` method, which runs on each `.next()`, after the call has returned. A sync method that returns an un-awaited `RpcPromise` gets a span that ends when the method returns, not when the promise settles (`spans` treats only a real `Promise` as async). Make the method `async` and `await` the call to time it.
 
@@ -847,7 +847,7 @@ export default {
 } satisfies ExportedHandler<Env>
 ```
 
-- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, with `options.serializeError` and `options.redact`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins).
+- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, with `options.serializeError` and `options.redact`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins). `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola).
 - The handler gets the same arguments; its return value is returned and a throw rethrown unchanged. It never calls `controller.noRetry()`.
 - On a class entrypoint (`WorkerEntrypoint`, `TracedEntrypoint`, `tracedWorker(...)`, `withLogging(...)`), wrap the handler once at module scope and call it from the method with `this.env` and `this.ctx`:
 
@@ -896,7 +896,7 @@ export default {
 - For an unsampled trace (`traceFlags` `00`) the `span.end` timing line is skipped, but a throw is still logged: one `queue.message failed` line at `ERROR` with `err` and a `span` object without timing (`operation`, `status: 'ERROR'`, `error`). A new root trace is always sampled.
 - `await` (or return) every call. The batch is acked implicitly when `queue` returns, so with a missing `await` the handler can return, and the batch be acked, while the work is still running, and its throw is lost.
 - Running the messages concurrently is safe: `await Promise.all(batch.messages.map((m) => withQueueMessage(batch, m, () => handle(m))))`. Each call has its own Logging Context, so Context Fields and traces never mix between messages.
-- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping-options) reads it) with `options.env` as the Env Mapping, `options.serializeError` and `options.redact`, and registered as the Default Logger unless one is already set.
+- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping-options) reads it) with `options.env` as the Env Mapping, `options.serializeError` and `options.redact`, and registered as the Default Logger unless one is already set. `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola).
 
 ### `withWorkflow(Class, options?)` and `tracedStep(step, name, ...)`
 
@@ -930,7 +930,7 @@ await env.REPORT.create({ params: { ...params, trace: getTraceCarrier() } })
 - When the payload has a Trace Carrier under `trace`, `run` continues it, so every replay of one instance shares the creator's `traceId`. Without one, each execution of `run` (every replay after a sleep, wait or restart) starts a new root trace, so one instance's lines span several `traceId`s: join them on `workflowInstanceId`, or pass `trace: getTraceCarrier()` to `create()`.
 - `run` itself writes no Span: it is replayed from the top after every sleep and wait, and a pause or termination surfaces in it as a throw. Lines logged in `run` outside a step repeat on each replay.
 - **A throw outside every `tracedStep` is not logged.** That covers validation before the first step, code between steps, and a plain `step.do`. The engine uses thrown errors in `run` for its own control flow (pause, terminate, restart; locally these are `Error`s whose message starts with `Aborting engine:`), and neither `@cloudflare/workers-types` nor the Workflows docs define a marker that tells them apart from your errors in production, so `withWorkflow` does not log when `run` rejects rather than log engine control as `ERROR`. Such a throw still fails the instance and shows as its error in the Workflows dashboard and `instance.status()`. Put every unit of work, validation included, in a `tracedStep`, which logs each failed attempt.
-- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env`, `options.serializeError` and `options.redact`, registered as the Default Logger in the constructor unless one is already set. Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
+- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env`, `options.serializeError` and `options.redact`, registered as the Default Logger in the constructor unless one is already set. `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola). Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
 - Outside a Logging Context (a class not wrapped with `withWorkflow`), `tracedStep` calls `step.do` with the arguments untouched and logs nothing.
 
 ### Service Type Convention
