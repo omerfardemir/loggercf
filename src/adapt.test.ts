@@ -110,6 +110,15 @@ describe('adaptLogger', () => {
       expect(Object.keys(target.lines[0]!.fields)).toEqual(['a', 'shared', 'b'])
     })
 
+    it('moves a binding for a Record Key to args, as the built-in logger does', () => {
+      const target = recordingTarget()
+      adaptLogger(target).child({ args: 'x', level: 'fatal', a: 1 }).info('m', [2])
+      expect(target.lines[0]!.fields).toEqual({
+        a: 1,
+        args: [{ level: 'fatal', args: 'x' }, [2]],
+      })
+    })
+
     it('merges the bindings of nested children, the nearest winning', () => {
       const target = recordingTarget()
       adaptLogger(target).child({ a: 1, b: 1 }).child({ b: 2 }).info('m')

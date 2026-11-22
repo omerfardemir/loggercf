@@ -12,11 +12,13 @@ pnpm add hono
 
 ## Entry Points
 
-| Import             | Contents                                                                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `loggercf`         | Core: `createLogger`, `runWithLogger`, `withSpan`, `getLogger`, `setDefaultLogger`, `setLoggerContext`, `loggerOptionsFromEnv`, `tracedFetch`, `tracedFetcher`, trace utilities, types      |
-| `loggercf/hono`    | `useLogger`, `generateId` — Hono middleware; `UseLoggerOptions`, `RequestIdOptions`, `RequestIdSource` types                                                                                |
-| `loggercf/workers` | `TracedSession`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withTrace`, `tracedSession`, `defaultLoggerFromEnv`, `withScheduled`, `withQueueMessage`, `withWorkflow`, `tracedStep` |
+| Import             | Contents                                                                                                                                                                                                                      |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `loggercf`         | Core: `createLogger`, `runWithLogger`, `withSpan`, `getLogger`, `setDefaultLogger`, `setLoggerContext`, `loggerOptionsFromEnv`, `tracedFetch`, `tracedFetcher`, `currentContextFields`, `adaptLogger`, trace utilities, types |
+| `loggercf/hono`    | `useLogger`, `generateId` — Hono middleware; `UseLoggerOptions`, `RequestIdOptions`, `RequestIdSource` types                                                                                                                  |
+| `loggercf/workers` | `TracedSession`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withTrace`, `tracedSession`, `defaultLoggerFromEnv`, `withScheduled`, `withQueueMessage`, `withWorkflow`, `tracedStep`                                   |
+| `loggercf/winston` | `fromWinston`, `contextFields`, `contextMeta` — [winston as your own logger](#your-own-logger-pino-winston-consola)                                                                                                           |
+| `loggercf/consola` | `fromConsola`, `withContextFields`, `jsonReporter` — [consola as your own logger](#your-own-logger-pino-winston-consola)                                                                                                      |
 
 ## How Trace Propagation Works
 
@@ -1376,6 +1378,98 @@ Only the final write differs, detected at startup:
 
 - **CF Workers** (`navigator.userAgent === 'Cloudflare-Workers'`): `console.debug` / `info` / `warn` / `error` by level, so Cloudflare assigns the right severity.
 - **Node.js**: `console.log` for every level (stdout).
+
+---
+
+## Your Own Logger (pino, winston, consola)
+
+loggercf's built-in logger is the default, but the Cloudflare parts (Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers) work with a logger you already use. Pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own included, so all lines share one sink and one format.
+
+| Logger  | Adapter                                                     | Context Fields on its lines                                                                                       | Recipe                                             |
+| ------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| pino    | none: pass the pino logger as it is                         | `mixin: currentContextFields`                                                                                     | [docs/loggers/pino.md](docs/loggers/pino.md)       |
+| winston | `fromWinston(logger)` from `loggercf/winston`               | added by `fromWinston` during each call; `contextMeta()` or the `contextFields()` format for direct winston calls | [docs/loggers/winston.md](docs/loggers/winston.md) |
+| consola | `fromConsola(consola)` from `loggercf/consola`              | added by `fromConsola`; `withContextFields(reporter)` or `jsonReporter()` for direct consola calls                | [docs/loggers/consola.md](docs/loggers/consola.md) |
+| other   | [`adaptLogger(target)`](#adaptloggertarget) from `loggercf` | [`currentContextFields()`](#currentcontextfields) in your `write`                                                 | below                                              |
+
+The adapters import nothing from winston or consola, at runtime or in their types: they work with the version you installed.
+
+### The Logger Port
+
+loggercf calls three things on a Root Logger:
+
+- each level method (`trace`, `debug`, `info`, `warn`, `error`, `fatal`) as `(fields, message, ...args)`, where the message may hold `printf` placeholders (`logger.info({ span }, 'span.end %s', operation)`), or as `(message)`;
+- `child(bindings)`, once per Logging Context (`child({})`), and for your own `.child()` calls.
+
+That is loggercf's `Logger` interface. A pino logger has this shape already. A logger without it is rejected when you pass it to a Workers helper, with a `TypeError` naming the methods it lacks.
+
+### Where to pass it
+
+```ts
+import { runWithLogger } from 'loggercf'
+import { useLogger } from 'loggercf/hono'
+import { TracedEntrypoint, withLogging, withScheduled } from 'loggercf/workers'
+
+app.use(useLogger(logger)) // Hono
+runWithLogger({ logger, traceparent }, () => handle()) // anything else
+
+export const scheduled = withScheduled(nightly, { logger })
+export const Search = withLogging(SearchBase, { logger })
+
+// A function of env, called once per env (once per isolate):
+export const Jobs = withLogging(JobsBase, { logger: (env: Env) => makeLogger(env) })
+
+// A TracedEntrypoint supplies it through its Root Logger hook:
+export class Bind extends TracedEntrypoint<Env> {
+  protected override get [TracedEntrypoint.rootLogger]() {
+    return logger
+  }
+}
+```
+
+The `logger` option is on `withScheduled`, `withQueueMessage`, `withWorkflow`, `withLogging` and `tracedWorker`. It replaces the Root Logger built from env, so passing `env`, `serializeError` or `redact` with it throws: configure your own logger instead. Like a built Root Logger, it becomes the [Default Logger](#setdefaultloggerlogger) unless one is already set, and `getLogger()` returns it (a child of it) inside each Logging Context.
+
+Keep it per-process: build it once at module scope, or from env with the function form. Per-unit-of-work data still goes in Context Fields (`setLoggerContext`), never in its bindings.
+
+### `currentContextFields()`
+
+The current Logging Context's Context Fields, then `traceId`, `spanId` and `parentSpanId` (left out of a root trace); `{}` outside a Logging Context. The trace IDs win over a Context Field of the same name, and each call returns a new object. loggercf's built-in logger writes these on every line itself; your logger writes them where you add them to its per-line hook.
+
+```ts
+import pino from 'pino'
+import { currentContextFields } from 'loggercf'
+
+const logger = pino({ mixin: currentContextFields })
+```
+
+### `adaptLogger(target)`
+
+Builds a `Logger` over any logger that doesn't have the Logger Port's shape, from a **Line Target**: a `write(line)` and an optional `child(bindings)`. Each call goes through loggercf's [Argument Routing](#where-each-argument-goes) first, in either call style, so `write` gets `{ level, message, fields }`: the message with its placeholders filled in (absent when the call gave none), and the fields as a plain object, with `err` (the first `Error`, unserialized), `errors` and `args`. Without `child`, the adapted logger keeps the bindings itself and writes them first in `fields`; the call's fields win on a shared key.
+
+```ts
+import { adaptLogger, currentContextFields } from 'loggercf'
+
+const logger = adaptLogger({
+  write: ({ level, message, fields }) =>
+    console.log(JSON.stringify({ level, message, ...currentContextFields(), ...fields })),
+})
+```
+
+It adds nothing of its own: no time, no level filter, no Context Fields (add `currentContextFields()` in `write`, as above). A log call never throws: a `write` that throws loses only its own line.
+
+### What doesn't apply
+
+The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes its own `serializeError`). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
+
+### Workers caveats
+
+loggercf itself needs `nodejs_compat` (for `node:async_hooks`). What each logger adds on top, measured with wrangler 4.160 (`wrangler deploy --dry-run`, and `wrangler dev` for the output); each recipe has the details:
+
+- **pino**: wrangler resolves `pino` to its browser build, which ignores `mixin` and `base` and writes the raw arguments to `console`, so loggercf's `%s` placeholders are never filled. Alias `pino` to its Node build (`"alias": { "pino": "pino/pino.js" }` in `wrangler.jsonc`), which needs `nodejs_compat`. Transports (`pino.transport()`, worker threads) don't run in Workers: write each line to `console` with a destination instead. The Node build adds about 160 KiB to the upload (about 30 KiB gzip).
+- **winston**: needs `nodejs_compat` (it imports `fs`, `http`, `zlib` and more). Only the Console transport is useful in a Worker. workerd's `util.debuglog` is always on, so winston's streams print `STREAM:` debug lines next to each log line unless you alias `util`. It adds about 400 KiB to the upload (about 67 KiB gzip; 172 KiB minified).
+- **consola**: bundles without `nodejs_compat`; every entry resolves to its browser build. Use `consola/core` with `jsonReporter()` (one JSON line per log through `console.debug` / `info` / `warn` / `error`, so Workers Logs sees the severity) and `throttle: 0` (consola holds repeated lines on a timer, which a Worker can lose). It adds about 25 KiB to the upload (about 6 KiB gzip).
+
+loggercf's built-in logger stays in the bundle when you bring your own.
 
 ---
 

@@ -1,5 +1,5 @@
 import type { LogFields, Logger, LogLevel } from './types'
-import { copyBindings, newBudget, type LogRecord } from './output'
+import { copyBindings, newBudget, takeRecordKeys, type LogRecord } from './output'
 import { routeArgs } from './route'
 
 /**
@@ -14,7 +14,9 @@ export interface LogLine {
   message?: string
   /**
    * The line's fields, a plain object: the logger's bindings (when the target has no
-   * `child`), then the call's fields, which win on a shared key. `err` is the first
+   * `child`), then the call's fields, which win on a shared key. A binding for a Record
+   * Key (`time`, `level`, `message`, `errors`, `args`) moves to `args`, as in the
+   * built-in logger. `err` is the first
    * `Error` (or a structured call's `err`), `errors` the ones after it, and `args`
    * the Overflow: the values with no better place, in call order.
    */
@@ -68,11 +70,14 @@ function assignOwn(target: Record<string, unknown>, source: LogRecord): void {
  */
 function toLine(level: LogLevel, bindings: LogRecord, input: unknown[]): LogLine {
   const { fields, message, errors, args } = routeArgs(input, newBudget())
+  // As in the built-in logger, bindings can't set a Record Key: their values move to `args`.
+  const moved: unknown[] = []
   const out: Record<string, unknown> = {}
-  assignOwn(out, bindings)
+  assignOwn(out, takeRecordKeys(bindings, moved as LogRecord[]) ?? {})
   assignOwn(out, fields)
   if (errors && errors.length > 0) out.errors = errors
-  if (args && args.length > 0) out.args = args
+  const overflow = [...moved, ...(args ?? [])]
+  if (overflow.length > 0) out.args = overflow
   return message === undefined ? { level, fields: out } : { level, message, fields: out }
 }
 
