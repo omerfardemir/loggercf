@@ -1488,12 +1488,19 @@ With pnpm 12.11 or later, run `pnpm approve` after installing and approve `logge
 
 ```
 loggercf/
-├── src/                  # loggercf source and colocated *.test.ts
-│   ├── index.ts          # Core entry: logger, Logging Context, Trace Carrier, types
+├── src/                  # loggercf source, each *.test.ts next to the module it covers
+│   ├── index.ts          # loggercf entry (the entry files only re-export)
 │   ├── hono.ts           # loggercf/hono entry
 │   ├── workers.ts        # loggercf/workers entry
-│   ├── winston.ts        # loggercf/winston entry (winston as Your Own Logger)
-│   └── consola.ts        # loggercf/consola entry (consola as Your Own Logger)
+│   ├── winston.ts        # loggercf/winston entry
+│   ├── consola.ts        # loggercf/consola entry
+│   ├── core/             # Logging Context, Root and Default Logger, Spans, Env Mapping, types
+│   ├── trace/            # W3C Trace Context and Trace Carrier, tracedFetch
+│   ├── output/           # A line: Argument Routing, serialization, Line Limits, Redactor
+│   ├── hono/             # useLogger middleware
+│   ├── workers/          # Traced Sessions, withLogging, the cron, queue and Workflow helpers
+│   ├── loggers/          # Your Own Logger: adaptLogger, the winston and consola adapters
+│   └── testing/          # Helpers shared by the tests
 ├── dev/                  # Local Worker fixtures for e2e verification (not published)
 │   ├── services.d.ts     # Shared RPC service interfaces
 │   ├── main-worker/      # Gateway worker (Hono + routes)

@@ -4,7 +4,7 @@ pino can be [Your Own Logger](../../CONTEXT.md): the Root Logger every line of a
 
 loggercf keeps doing the Cloudflare plumbing: Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers. pino does the writing: its levels, serializers, redaction and destination.
 
-Everything below was checked with pino 10.4 (`src/pino.test.ts`), and the Workers part with wrangler 4.160 and `wrangler dev`.
+Everything below was checked with pino 10.4 (`src/loggers/pino.test.ts`), and the Workers part with wrangler 4.160 and `wrangler dev`.
 
 ## Install
 

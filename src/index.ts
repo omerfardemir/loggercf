@@ -13,7 +13,7 @@ export type {
   RedactKeysOptions,
   Logger,
   LogLevel,
-} from './types'
+} from './core/types'
 
 export {
   createLogger,
@@ -25,15 +25,15 @@ export {
   getTraceContext,
   getTraceCarrier,
   currentContextFields,
-} from './logger'
-export { adaptLogger } from './adapt'
-export type { LineTarget, LogLine } from './adapt'
-export { omitErrorKeys } from './omit'
-export { redactKeys } from './redact'
-export { tracedFetch, tracedFetcher } from './fetch'
-export type { TracedFetchOptions } from './fetch'
-export { loggerOptionsFromEnv } from './env'
-export type { EnvMapping, EnvSource } from './env'
+} from './core/logger'
+export { adaptLogger } from './loggers/adapt'
+export type { LineTarget, LogLine } from './loggers/adapt'
+export { omitErrorKeys } from './output/omit'
+export { redactKeys } from './output/redact'
+export { tracedFetch, tracedFetcher } from './trace/fetch'
+export type { TracedFetchOptions } from './trace/fetch'
+export { loggerOptionsFromEnv } from './core/env'
+export type { EnvMapping, EnvSource } from './core/env'
 export type {
   TracedServiceBinding,
   SessionInit,
