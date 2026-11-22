@@ -200,9 +200,9 @@ describe('loggercf/winston', () => {
 
       it("doesn't build a line winston would not write: its Errors are not serialized", () => {
         const { w } = memoryWinston({ level: 'info' })
-        const serializeError = vi.fn((err: Error) => err.message)
-        fromWinston(w, { serializeError }).debug(new Error('hidden'))
-        expect(serializeError).not.toHaveBeenCalled()
+        const writeError = vi.fn((err: Error) => err.message)
+        fromWinston(w, { writeError }).debug(new Error('hidden'))
+        expect(writeError).not.toHaveBeenCalled()
       })
     })
 
@@ -300,10 +300,10 @@ describe('loggercf/winston', () => {
         })
       })
 
-      it('writes each Error with your serializeError, given the default shape too', () => {
+      it('writes each Error with your writeError, given the default shape too', () => {
         const { w, lines } = memoryWinston()
         const logger = fromWinston(w, {
-          serializeError: (err, defaultSerialize) => {
+          writeError: (err, defaultSerialize) => {
             const { stack: _stack, ...rest } = defaultSerialize(err)
             return { ...rest, code: 'E1' }
           },
@@ -312,18 +312,18 @@ describe('loggercf/winston', () => {
         expect(lines()[0]!.err).toEqual({ type: 'Error', message: 'boom', code: 'E1' })
       })
 
-      it('hands winston the Error itself when your serializeError returns it', () => {
+      it('hands winston the Error itself when your writeError returns it', () => {
         const infos: WinstonInfo[] = []
         const err = new Error('raw')
         const target: WinstonLike = { write: (info) => void infos.push(info) }
-        fromWinston(target, { serializeError: (e) => e }).error(err)
+        fromWinston(target, { writeError: (e) => e }).error(err)
         expect(infos[0]!.err).toBe(err)
       })
 
-      it('writes the default shape with serializeErrorFailed when your serializeError throws', () => {
+      it('writes the default shape with serializeErrorFailed when your writeError throws', () => {
         const { w, lines } = memoryWinston()
         const logger = fromWinston(w, {
-          serializeError: () => {
+          writeError: () => {
             throw new RangeError('bad serializer')
           },
         })

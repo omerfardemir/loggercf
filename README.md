@@ -1450,16 +1450,17 @@ Builds a `Logger` over any logger that doesn't have the Logger Port's shape, fro
 import { adaptLogger, currentContextFields } from 'loggercf'
 
 const logger = adaptLogger({
+  // console prints an Error with its stack; JSON.stringify would write it as {}.
   write: ({ level, message, fields }) =>
-    console.log(JSON.stringify({ level, message, ...currentContextFields(), ...fields })),
+    console.log(level, message ?? '', { ...currentContextFields(), ...fields }),
 })
 ```
 
-It adds nothing of its own: no time, no level filter, no Context Fields (add `currentContextFields()` in `write`, as above). A log call never throws: a `write` that throws loses only its own line.
+It adds nothing of its own: no time, no level filter, no Context Fields (add `currentContextFields()` in `write`, as above), and no serialization: an `Error` in `fields` is still an `Error`, so a `write` that builds JSON must serialize it. A log call never throws: a `write` that throws loses only its own line.
 
 ### What doesn't apply
 
-The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes its own `serializeError`). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
+The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes a `writeError` for loggercf's lines). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
 
 ### Workers caveats
 

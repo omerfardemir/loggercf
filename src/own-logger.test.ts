@@ -157,7 +157,9 @@ describe('your own Root Logger', () => {
 
     it('throws when a function of env returns something that is not a Logger', () => {
       const handler = withScheduled(() => {}, { logger: () => ({}) as Logger })
-      expect(() => handler(controller(), ENV, CTX)).toThrow(/logger must be a Logger/)
+      expect(() => handler(controller(), ENV, CTX)).toThrow(
+        /^withScheduled\(\): logger must be a Logger/,
+      )
     })
   })
 

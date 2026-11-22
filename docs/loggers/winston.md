@@ -181,11 +181,11 @@ And `request.end` for a handler that threw (stack shortened):
 
 **`format.splat()` doesn't format it again.** Each info object carries an empty splat, so a `%` in the formatted message (`logger.info('%s', '100%s done')`) stays as it is, and a field named `splat` is only a field.
 
-**Errors are written, not `{}`.** `format.json()` writes an `Error` as `{}`, and `format.errors()` only looks at the info object itself or its `message`. So `fromWinston` writes every `Error` in the line's fields (`err`, `errors`, and inside plain objects and arrays at any depth) in loggercf's default shape, `{ type, message, stack, ...own props, cause? }`, before winston sees it. Your objects are not changed: what holds an `Error` is copied. An object inside itself is `"[Circular]"` there. Pass `serializeError` to write them your way:
+**Errors are written, not `{}`.** `format.json()` writes an `Error` as `{}`, and `format.errors()` only looks at the info object itself or its `message`. So `fromWinston` writes every `Error` in the line's fields (`err`, `errors`, and inside plain objects and arrays at any depth) in loggercf's default shape, `{ type, message, stack, ...own props, cause? }`, before winston sees it. Your objects are not changed: what holds an `Error` is copied. An object inside itself is `"[Circular]"` there. Pass `writeError` to write them your way:
 
 ```ts
 const logger = fromWinston(w, {
-  serializeError: (err, defaultSerialize) => {
+  writeError: (err, defaultSerialize) => {
     const { stack, ...rest } = defaultSerialize(err)
     return rest
   },
@@ -196,7 +196,7 @@ What it returns goes to winston as it is: return `err` itself if a format of you
 
 **Context Fields at the call.** Each line carries the current Logging Context's Context Fields and trace IDs, taken during the call, with or without `contextFields()` in your format. Strongest first: the trace IDs, the call's fields, the bindings of `logger.child(...)`, winston's `defaultMeta`, the Context Fields. A binding or Context Field named `level` or `message` moves to `args`, so it can't change the line's level or message.
 
-**`child`.** `logger.child(bindings)` keeps the bindings in the adapter and writes them on each line, so they win over `defaultMeta` and the Context Fields, as loggercf's bindings do. To adapt a winston child, `fromWinston(w.child({ module: 'db' }))` works too; winston puts its metadata under everything else on the line.
+**`child`.** `logger.child(bindings)` keeps the bindings in the adapter and writes them on each line, so they win over `defaultMeta` and the Context Fields, as loggercf's bindings do. To adapt a winston child, `fromWinston(w.child({ module: 'db' }))` works too; winston writes its child's fields under everything else on the line.
 
 **Filtering is winston's.** A line below the winston logger's level (or every transport's) is not built at all.
 
@@ -262,14 +262,14 @@ winston copies `defaultMeta` into each line during the call, so each line carrie
 
 The Logger Options configure loggercf's built-in logger, not winston. With your winston logger:
 
-| Logger Option                                                 | With winston                                                                                                                 |
-| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `level`, `LOG_LEVEL`                                          | winston's `level` (and each transport's). Read it from env in a function of env, as above.                                   |
-| `service`, `environment`, `version`                           | winston's `defaultMeta`, or `contextMeta({ service })`.                                                                      |
-| Span Defaults (`spans`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`) | None: each Span is at `info` unless its own `level` / `slowMs` options say otherwise.                                        |
-| `serializeError` (Error Serializer)                           | `fromWinston`'s `serializeError` option, for loggercf's lines. Your direct calls: `format.errors()` or a format of your own. |
-| `limits` (Line Limits)                                        | None in winston: write a format that cuts long values.                                                                       |
-| `redact` (Redactor)                                           | A format of your own that replaces values before `format.json()`.                                                            |
+| Logger Option                                                 | With winston                                                                                                             |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `level`, `LOG_LEVEL`                                          | winston's `level` (and each transport's). Read it from env in a function of env, as above.                               |
+| `service`, `environment`, `version`                           | winston's `defaultMeta`, or `contextMeta({ service })`.                                                                  |
+| Span Defaults (`spans`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`) | None: each Span is at `info` unless its own `level` / `slowMs` options say otherwise.                                    |
+| `serializeError` (Error Serializer)                           | `fromWinston`'s `writeError` option, for loggercf's lines. Your direct calls: `format.errors()` or a format of your own. |
+| `limits` (Line Limits)                                        | None in winston: write a format that cuts long values.                                                                   |
+| `redact` (Redactor)                                           | A format of your own that replaces values before `format.json()`.                                                        |
 
 ## Workers caveats
 

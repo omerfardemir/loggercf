@@ -55,10 +55,16 @@ export interface RootLoggerSource<E = unknown> {
   logger?: Logger | ((env: E) => Logger)
 }
 
+/**
+ * A helper's Root Logger source as `rootLoggerSource()` returns it: with the helper
+ * call, so an error about its `logger` names the helper.
+ */
+export type CheckedRootLoggerSource<E = unknown> = RootLoggerSource<E> & { where?: string }
+
 /** The code-only Logger Options of a helper's options: all but the Env Mapping. */
 export type CodeOptions = Pick<RootLoggerSource, 'serializeError' | 'redact'>
 
-/** The level methods every Root Logger has. */
+/** The methods every Root Logger has: the six level methods and `child`. */
 const LOGGER_METHODS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'child'] as const
 
 /**
@@ -90,13 +96,13 @@ export function checkLogger(logger: unknown, where: string): Logger {
  *
  * @param {RootLoggerSource<E>} options - A helper's options.
  * @param {string} [where] - The helper call, for error messages (`withScheduled()`).
- * @returns {RootLoggerSource<E>} Its Root Logger source.
+ * @returns {CheckedRootLoggerSource<E>} Its Root Logger source.
  * @throws {TypeError} When `logger` is given with `env`, `serializeError` or `redact`, or is not a `Logger` or a function.
  */
 export function rootLoggerSource<E>(
   options: RootLoggerSource<E>,
   where = 'loggercf',
-): RootLoggerSource<E> {
+): CheckedRootLoggerSource<E> {
   const { env, serializeError, redact, logger } = options
   if (logger === undefined) return { env, serializeError, redact }
   const extra = (
@@ -112,7 +118,7 @@ export function rootLoggerSource<E>(
     )
   }
   if (typeof logger !== 'function') checkLogger(logger, where)
-  return { logger }
+  return { logger, where }
 }
 
 /**
@@ -292,8 +298,8 @@ export function _resetRootLoggers(): void {
  * @param {RootLoggerSource<any>} [source] - The helper's `env`, `serializeError`, `redact` and `logger` options.
  * @returns {Logger} The Root Logger.
  */
-export function envRootLogger(env: unknown, source: RootLoggerSource<any> = {}): Logger {
-  if (source.logger !== undefined) return ownRootLogger(source.logger, env)
+export function envRootLogger(env: unknown, source: CheckedRootLoggerSource<any> = {}): Logger {
+  if (source.logger !== undefined) return ownRootLogger(source.logger, env, source.where)
   return cachedRootLogger(withCodeOptions(loggerOptionsFromEnv(env, source.env), source))
 }
 

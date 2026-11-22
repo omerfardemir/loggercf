@@ -72,7 +72,7 @@ export interface FromWinstonOptions {
    * Errors. When it throws, that `Error` is written in the default shape with
    * `serializeErrorFailed`.
    */
-  serializeError?: (err: Error, defaultSerialize: (err: Error) => LogRecord) => unknown
+  writeError?: (err: Error, defaultSerialize: (err: Error) => LogRecord) => unknown
 }
 
 /** winston's own key for the level, which its transports filter on (triple-beam's `LEVEL`). */
@@ -211,7 +211,7 @@ function withErrorsWritten(
 }
 
 /**
- * loggercf's default shape for one `Error`, as `serializeError` gets it.
+ * loggercf's default shape for one `Error`, as `writeError` gets it.
  *
  * @param {Error} err - The `Error`.
  * @returns {LogRecord} `{ type, message, stack, ...own props, cause? }`.
@@ -219,13 +219,13 @@ function withErrorsWritten(
 const defaultSerialize = (err: Error): LogRecord => defaultErrorShape(err)
 
 /**
- * The function that writes each `Error` of one line: the `serializeError` option, or
+ * The function that writes each `Error` of one line: the `writeError` option, or
  * loggercf's default shape. The same `Error` twice on a line is written once.
  *
- * @param {FromWinstonOptions['serializeError']} custom - The `serializeError` option.
+ * @param {FromWinstonOptions['writeError']} custom - The `writeError` option.
  * @returns {(err: Error) => unknown} The writer, for one line.
  */
-function errorWriter(custom: FromWinstonOptions['serializeError']): (err: Error) => unknown {
+function errorWriter(custom: FromWinstonOptions['writeError']): (err: Error) => unknown {
   const written = new Map<Error, unknown>()
   return (err) => {
     if (written.has(err)) return written.get(err)
@@ -347,12 +347,12 @@ export function fromWinston<T extends LogFields = LogFields>(
   options: FromWinstonOptions = {},
 ): Logger<T> {
   const levels = mapLevels(logger.levels ?? NPM_LEVELS, options.levels ?? {})
-  const { serializeError } = options
+  const { writeError } = options
   return adaptLogger<T>({
     write(line) {
       const level = levels[line.level]
       if (typeof logger.isLevelEnabled === 'function' && !logger.isLevelEnabled(level)) return
-      logger.write(toInfo(line, level, logger.defaultMeta, errorWriter(serializeError)))
+      logger.write(toInfo(line, level, logger.defaultMeta, errorWriter(writeError)))
     },
   })
 }
