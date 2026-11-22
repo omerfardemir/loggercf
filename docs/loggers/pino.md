@@ -20,6 +20,17 @@ Build one pino logger per process or isolate, at module scope:
 import pino from 'pino'
 import { currentContextFields } from 'loggercf'
 
+/**
+ * pino merges the mixin under the call's fields. This keeps that order for the Context
+ * Fields but writes the trace IDs over everything, as loggercf's built-in logger does,
+ * so a call's own `traceId` can't replace the Logging Context's.
+ */
+function contextWins(mergeObject: object, mixinObject: object): object {
+  const { traceId, spanId, parentSpanId, ...fields } = mixinObject as Record<string, unknown>
+  if (traceId === undefined) return { ...fields, ...mergeObject } // outside a Logging Context
+  return { ...fields, ...mergeObject, traceId, spanId, parentSpanId }
+}
+
 export const logger = pino({
   level: 'info',
   // loggercf's own lines call the message `message`; pino calls it `msg` by default.
@@ -28,6 +39,8 @@ export const logger = pino({
   base: { service: 'api', environment: 'production', version: '1.4.0' },
   // The current Logging Context's Context Fields, traceId, spanId and parentSpanId.
   mixin: currentContextFields,
+  // The trace IDs win over a call's fields of the same name (see Key collisions).
+  mixinMergeStrategy: contextWins,
   // Optional: write `level` and `time` the way loggercf's own lines do ("INFO", ISO 8601).
   formatters: { level: (label) => ({ level: label.toUpperCase() }) },
   timestamp: pino.stdTimeFunctions.isoTime,
@@ -35,6 +48,7 @@ export const logger = pino({
 ```
 
 - **`mixin: currentContextFields`** is what puts `requestId`, `userId`, `traceId`, `spanId` and `parentSpanId` on pino's lines. pino calls it for every line; outside a Logging Context it returns `{}`, so the line gets nothing. Without it, lines written inside a Logging Context have no Context Fields and no trace IDs (the Request Lines still have `requestId`, which they pass themselves).
+- **`mixinMergeStrategy: contextWins`** keeps the trace IDs right. Without it, pino lets a call's fields win over the mixin, so `getLogger().info({ traceId: 'x' })` would replace the Logging Context's `traceId`. With it, the order is the built-in logger's: Context Fields, then the call's fields, then the trace IDs. It builds a new object, so the call's object is left as it was. pino's `.child()` bindings are written separately and are not affected (see [Key collisions](#key-collisions)).
 - **`messageKey: 'message'`** is recommended, not required. loggercf's built-in core writes `message`, so with it a query on `message` finds lines from both. Without it pino writes `msg`, and a call field named `message` is a plain field.
 - **`base`** holds what loggercf's Logger Options would have held: `service`, `environment`, `version`. Per-unit-of-work data never goes there or in a `.child()` of the Root Logger; it goes in Context Fields (`setLoggerContext`, or the `fields` of `runWithLogger`).
 
@@ -306,14 +320,7 @@ const logger = pino({
 
 loggercf's core keeps some keys for itself (the Record Keys and Moved Keys); pino doesn't, and writes every key it is given, duplicates included:
 
-- **A call's fields win over the mixin.** pino merges the mixin's object under the call's, so `getLogger().info({ traceId: 'mine' })` replaces the Logging Context's `traceId` (loggercf's core would move it to `args`). To make the Logging Context win, merge the other way, into a new object so the call's object is left as it was:
-
-  ```ts
-  pino({
-    mixin: currentContextFields,
-    mixinMergeStrategy: (mergeObject, mixinObject) => ({ ...mergeObject, ...mixinObject }),
-  })
-  ```
+- **A call's fields win over the mixin.** pino merges the mixin's object under the call's, so without a `mixinMergeStrategy` `getLogger().info({ traceId: 'mine' })` replaces the Logging Context's `traceId` (loggercf's core would move it to `args`). The recipe's `contextWins` (see [The Root Logger](#the-root-logger)) writes the trace IDs last and leaves every other key to the call. Don't merge the whole mixin over the call (`{ ...mergeObject, ...mixinObject }`): that lets every Context Field beat the call's own fields too.
 
 - **A Context Field or a call field named `level` or `time`** (or `msg`, or `message` with `messageKey: 'message'`) is written a second time in the same line. A JSON parser keeps the last one, so a Context Field `level: 'custom'` replaces the line's level when the line is read. The message pino writes is the last key, so it still wins. Don't name Context Fields after pino's keys.
 - **A `.child()` binding and a Context Field of the same name** are both written, the binding first; the Context Field wins when the line is read.
@@ -368,6 +375,7 @@ export const logger = pino(
     messageKey: 'message',
     base: { service: env.NAME, environment: env.ENVIRONMENT },
     mixin: currentContextFields,
+    mixinMergeStrategy: contextWins, // as in "The Root Logger" above
     formatters: { level: (label) => ({ level: label.toUpperCase() }) },
     timestamp: pino.stdTimeFunctions.isoTime,
   },

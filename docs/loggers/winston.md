@@ -1,6 +1,6 @@
 # winston with loggercf
 
-Keep winston, with its transports and formats, and use it as Your Own Logger: loggercf's own lines (Request Lines, `span.end`, failure lines) and your `getLogger()` calls all go through it, so every line shares one sink and one format. `loggercf/winston` is the thin part in between:
+Keep winston, with its transports and formats, and use it as Your Own Logger: loggercf's own lines (Request Lines, `span.end`, failure lines) and your `getLogger()` calls all go through it, so every line shares one output and one format. `loggercf/winston` is the thin part in between:
 
 - `fromWinston(w)`: a loggercf `Logger` over a winston logger, to pass anywhere loggercf takes a Root Logger.
 - `contextFields()`: a winston format that adds the current Logging Context's Context Fields and trace IDs to your direct winston calls (`w.info(...)`).
@@ -275,7 +275,7 @@ The Logger Options configure loggercf's built-in logger, not winston. With your 
 
 Measured with wrangler 4.160.1 and winston 3.19.0, on a Worker with Hono, `useLogger(fromWinston(w))` and a winston `Console` transport.
 
-**`nodejs_compat` is required.** loggercf itself needs only `nodejs_als` (for `AsyncLocalStorage`), but winston doesn't bundle without `nodejs_compat`: it imports `buffer`, `events`, `fs`, `http`, `https`, `os`, `path`, `util` and `zlib`.
+**`nodejs_compat` is required.** loggercf itself needs it already (see [Cloudflare Worker Requirements](../../README.md#cloudflare-worker-requirements)), and winston doesn't bundle without it either: it imports `buffer`, `events`, `fs`, `http`, `https`, `os`, `path`, `util` and `zlib`.
 
 ```jsonc
 // wrangler.jsonc

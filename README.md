@@ -1383,7 +1383,7 @@ Only the final write differs, detected at startup:
 
 ## Your Own Logger (pino, winston, consola)
 
-loggercf's built-in logger is the default, but the Cloudflare parts (Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers) work with a logger you already use. Pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own included, so all lines share one sink and one format.
+loggercf's built-in logger is the default, but the Cloudflare parts (Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers) work with a logger you already use. Pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own included, so all lines share one output and one format.
 
 | Logger  | Adapter                                                     | Context Fields on its lines                                                                                       | Recipe                                             |
 | ------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
@@ -1442,6 +1442,8 @@ import { currentContextFields } from 'loggercf'
 const logger = pino({ mixin: currentContextFields })
 ```
 
+pino writes a call's fields over the mixin's, so a call's own `traceId` would replace the Logging Context's; the [pino recipe](docs/loggers/pino.md#the-root-logger) adds a `mixinMergeStrategy` that writes the trace IDs last.
+
 ### `adaptLogger(target)`
 
 Builds a `Logger` over any logger that doesn't have the Logger Port's shape, from a **Line Target**: a `write(line)` and an optional `child(bindings)`. Each call goes through loggercf's [Argument Routing](#where-each-argument-goes) first, in either call style, so `write` gets `{ level, message, fields }`: the message with its placeholders filled in (absent when the call gave none), and the fields as a plain object, with `err` (the first `Error`, unserialized), `errors` and `args`. Without `child`, the adapted logger keeps the bindings itself and writes them first in `fields`; the call's fields win on a shared key.
@@ -1489,7 +1491,9 @@ loggercf/
 ├── src/                  # loggercf source and colocated *.test.ts
 │   ├── index.ts          # Core entry: logger, Logging Context, Trace Carrier, types
 │   ├── hono.ts           # loggercf/hono entry
-│   └── workers.ts        # loggercf/workers entry
+│   ├── workers.ts        # loggercf/workers entry
+│   ├── winston.ts        # loggercf/winston entry (winston as Your Own Logger)
+│   └── consola.ts        # loggercf/consola entry (consola as Your Own Logger)
 ├── dev/                  # Local Worker fixtures for e2e verification (not published)
 │   ├── services.d.ts     # Shared RPC service interfaces
 │   ├── main-worker/      # Gateway worker (Hono + routes)
@@ -1498,6 +1502,7 @@ loggercf/
 ├── skills/loggercf/     # Agent skill shipped in the package
 ├── scripts/e2e-local.mjs # Starts the dev workers, probes trace propagation, checks their logs
 └── docs/                 # Design deep-dives
+    └── loggers/          # Recipes for Your Own Logger: pino, winston, consola
 ```
 
 The dev workers import `loggercf` by package name, which resolves to this package's built `dist/` — run `pnpm build` before `pnpm dev`.

@@ -75,6 +75,17 @@ const CTX = {} as ExecutionContext
 type Line = Record<string, any>
 
 /**
+ * The pino recipe's `mixinMergeStrategy` (docs/loggers/pino.md): the Context Fields under
+ * the call's fields, and the trace IDs over everything, as on the built-in logger's lines.
+ * Outside a Logging Context the mixin is `{}`, and the call's fields are written as they are.
+ */
+const contextWins = (mergeObject: object, mixinObject: object): object => {
+  const { traceId, spanId, parentSpanId, ...fields } = mixinObject as Record<string, unknown>
+  if (traceId === undefined) return { ...fields, ...mergeObject } // outside a Logging Context
+  return { ...fields, ...mergeObject, traceId, spanId, parentSpanId }
+}
+
+/**
  * A real pino logger that writes to memory, synchronously: each line as pino wrote it
  * (`raw`) and parsed (`lines`). `mixin: currentContextFields` and `base: {}` (no `pid` or
  * `hostname`) unless `options` say otherwise.
@@ -502,14 +513,31 @@ describe('pino as your own logger', () => {
       expect(lines[0]).toMatchObject({ traceId: 'mine', requestId: 'call' })
     })
 
-    it("lets the mixin win with a mixinMergeStrategy, leaving the call's object unchanged", () => {
-      const { logger, lines } = memoryPino({
-        mixinMergeStrategy: (mergeObject, mixinObject) => ({ ...mergeObject, ...mixinObject }),
+    it("with the recipe's mixinMergeStrategy, the trace IDs win over a call's; the call's other fields still win", () => {
+      const { logger, lines } = memoryPino({ mixinMergeStrategy: contextWins })
+      const fields = { traceId: 'mine', spanId: 'mine', requestId: 'call', a: 1 }
+      runWithLogger({ logger, traceparent: SAMPLED, fields: { requestId: 'ctx', userId: 7 } }, () =>
+        getLogger().info(fields, 'm'),
+      )
+      expect(lines[0]).toMatchObject({
+        traceId: TRACE_ID,
+        spanId: expect.stringMatching(HEX16),
+        parentSpanId: PARENT_SPAN_ID,
+        requestId: 'call',
+        userId: 7,
+        a: 1,
       })
-      const fields = { traceId: 'mine', a: 1 }
-      runWithLogger({ logger, traceparent: SAMPLED }, () => getLogger().info(fields, 'm'))
-      expect(lines[0]).toMatchObject({ traceId: TRACE_ID, a: 1 })
-      expect(fields).toEqual({ traceId: 'mine', a: 1 })
+      expect(lines[0]!.spanId).not.toBe('mine')
+      expect(fields).toEqual({ traceId: 'mine', spanId: 'mine', requestId: 'call', a: 1 })
+    })
+
+    it("with the recipe's mixinMergeStrategy, a root trace has no parentSpanId, and a call outside a Logging Context keeps its own", () => {
+      const { logger, lines } = memoryPino({ mixinMergeStrategy: contextWins })
+      runWithLogger({ logger }, () => getLogger().info({ parentSpanId: 'mine' }, 'root'))
+      logger.info({ traceId: 'mine' }, 'outside')
+      expect(lines[0]).not.toHaveProperty('parentSpanId')
+      expect(lines[0]).toHaveProperty('traceId')
+      expect(lines[1]).toMatchObject({ traceId: 'mine' })
     })
 
     it('a Context Field named level, time or msg is written a second time, and wins when the line is parsed', () => {
