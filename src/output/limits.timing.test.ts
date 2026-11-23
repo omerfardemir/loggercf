@@ -45,11 +45,14 @@ function lastResortTime(n: number): number {
  * of short values (strings, numbers, keys), whose own walk is quick, so a
  * measuring pass shows, and a long string.
  */
-const MULTI_MB: [string, () => Record<string, unknown>][] = [
+const MULTI_MB: [string, () => Record<string, unknown>, number?][] = [
   ['a 20 MB string', () => ({ s: 'x'.repeat(20_000_000) })],
   [
     '2.2 MB, an array of 100k short strings',
     () => ({ list: Array.from({ length: 100_000 }, (_, i) => `item-${i}-zzzzzzzz`) }),
+    // On Node 24 this shape measures 1.17x-1.22x alone, and about 1.27x on CI's runners (1.1x
+    // on Node 22). Read back, as before #47, it took 2.71x, so 1.4x still catches that.
+    1.4,
   ],
   [
     '1.1 MB, an array of 150k numbers',
@@ -151,18 +154,19 @@ describe('limits are bounded in time', () => {
     expect(lastResortTime(2_000_000) / lastResortTime(500_000)).toBeLessThan(10)
   }, 30_000)
 
-  // Written whole and read back, these took 1.3x to 3.3x as long; now 0.9x to 1.2x. Under load a
-  // run can go over, so a failing one is measured again: a real regression stays over.
+  // Written whole and read back, these took 1.3x to 3.3x as long; now 0.9x to 1.2x, and up to
+  // about 1.3x for many short strings on Node 24 (see MULTI_MB). A run that goes over is measured
+  // again: a real regression stays over.
   it.each(
-    MULTI_MB.flatMap(([name, fields]) => [
-      [name, fields, false],
-      [`${name}, redacted`, fields, true],
-    ]) as [string, () => Record<string, unknown>, boolean][],
+    MULTI_MB.flatMap(([name, fields, bound = 1.25]) => [
+      [name, fields, false, bound],
+      [`${name}, redacted`, fields, true, bound],
+    ]) as [string, () => Record<string, unknown>, boolean, number][],
   )(
-    'an oversized multi-MB line costs at most about 1.2x what writing it whole does: %s',
+    'an oversized multi-MB line costs little more than writing it whole does: %s',
     { timeout: 60_000, retry: 2 },
-    (_, fields, redact) => {
-      expect(trimRatio(fields(), redact)).toBeLessThan(1.25)
+    (_, fields, redact, bound) => {
+      expect(trimRatio(fields(), redact)).toBeLessThan(bound)
     },
   )
 })
