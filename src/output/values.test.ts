@@ -934,7 +934,7 @@ describe('one Re-write Budget per line', () => {
     expect(line.message.length).toBeLessThan(once + 200_000 + 500 * 3)
     expect(line.message.startsWith(`${JSON.stringify(shared)} %j`)).toBe(true)
     expect(line.k19999).toBe(19_999) // the unprinted copies are routed
-  })
+  }, 30_000) // about 2s: generous for loaded CI machines
 
   it('the message and the fields share it', () => {
     const entries = _captureEntries()

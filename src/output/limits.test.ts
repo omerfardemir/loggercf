@@ -845,7 +845,7 @@ describe("limits.maxRecordBytes on the walk's copy", () => {
         expect(expected).not.toContain('logError')
         expect(bytes(expected)).toBeLessThanOrEqual(max)
       }
-  })
+  }, 30_000) // 6,146 lines: about 2.5s, generous for loaded CI machines
 
   it('a dropped tail is measured to the byte: its marker holds what the dropped items took', () => {
     const items = Array.from(
