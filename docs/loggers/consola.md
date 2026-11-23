@@ -22,10 +22,10 @@ pnpm add loggercf consola
 
 ## Which consola to import
 
-| Runtime            | Import                                         | Reporter to use                                                                                      |
-| ------------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Cloudflare Workers | `import { createConsola } from 'consola/core'` | `jsonReporter()`: one JSON line per log, for Workers Logs                                            |
-| Node.js            | `import { createConsola } from 'consola'`      | consola's own (FancyReporter in a terminal, BasicReporter in CI), wrapped with `withContextFields()` |
+| Runtime            | Import                                         | Reporter to use                                                                                          |
+| ------------------ | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Cloudflare Workers | `import { createConsola } from 'consola/core'` | `jsonReporter()`: one JSON line per log, for Workers Logs                                                |
+| Node.js            | `import { createConsola } from 'consola'`      | consola's own (FancyReporter in a terminal, BasicReporter in CI), wrapped with `contextFieldsReporter()` |
 
 In a Worker, wrangler resolves `consola`, `consola/basic` and `consola/browser` to consola's browser build, with or without `nodejs_compat`: its export conditions send everything but Node to `dist/browser.mjs`, whose only reporter is `BrowserReporter` (CSS badges for the browser console). `consola/core` is the same `Consola` class with no reporter, and the smallest; give it `jsonReporter()`. See [Workers caveats](#workers-caveats).
 
@@ -47,13 +47,13 @@ export const consola = createConsola({
 
 ```ts
 import { createConsola } from 'consola'
-import { withContextFields } from 'loggercf/consola'
+import { contextFieldsReporter } from 'loggercf/consola'
 
 export const consola = createConsola({ throttle: 0 })
-consola.setReporters(consola.options.reporters.map(withContextFields))
+consola.setReporters(consola.options.reporters.map(contextFieldsReporter))
 ```
 
-`withContextFields()` and `jsonReporter()` matter only for the calls you make on consola directly (`consola.info(...)`); the lines of `fromConsola()` carry the Context Fields whatever the reporter. See [Context Fields](#context-fields).
+`contextFieldsReporter()` and `jsonReporter()` matter only for the calls you make on consola directly (`consola.info(...)`); the lines of `fromConsola()` carry the Context Fields whatever the reporter. See [Context Fields](#context-fields).
 
 ## `fromConsola(consola)`
 
@@ -186,14 +186,14 @@ A log call never throws, even when a reporter does.
 
 ## Context Fields
 
-| Line                                                                       | Carries the Context Fields and trace IDs                                       |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| loggercf's own and `getLogger()`'s, through `fromConsola()`                | always: `fromConsola()` merges `currentContextFields()` into the fields object |
-| your `consola.info(...)`, with `jsonReporter()`                            | yes: merged into the JSON line, the call's fields winning, the trace IDs last  |
-| your `consola.info(...)`, with a reporter wrapped in `withContextFields()` | yes: `currentContextFields()` appended as the last argument                    |
-| your `consola.info(...)`, with any other reporter                          | no                                                                             |
+| Line                                                                           | Carries the Context Fields and trace IDs                                       |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| loggercf's own and `getLogger()`'s, through `fromConsola()`                    | always: `fromConsola()` merges `currentContextFields()` into the fields object |
+| your `consola.info(...)`, with `jsonReporter()`                                | yes: merged into the JSON line, the call's fields winning, the trace IDs last  |
+| your `consola.info(...)`, with a reporter wrapped in `contextFieldsReporter()` | yes: `currentContextFields()` appended as the last argument                    |
+| your `consola.info(...)`, with any other reporter                              | no                                                                             |
 
-Each line gets them once: both reporters recognise a line from `fromConsola()` (by a symbol-keyed property consola's reporters never print) and leave it as it is. `withContextFields()` never changes the log object the other reporters get. The `.child()` bindings of your loggercf logger (`service`...) are on its lines only, not on your direct consola calls.
+Each line gets them once: both reporters recognise a line from `fromConsola()` (by a symbol-keyed property consola's reporters never print) and leave it as it is. `contextFieldsReporter()` never changes the log object the other reporters get. The `.child()` bindings of your loggercf logger (`service`...) are on its lines only, not on your direct consola calls.
 
 ## Levels
 
@@ -216,7 +216,7 @@ consola's default level is `info` (3): `trace` and `debug` lines, `span.end` at 
 
 loggercf's own lines and a direct consola call, from one request to a Hono app with `useLogger(fromConsola(consola).child({ service: 'api' }))`, a handler that logs, calls `consola.success('cache warmed')`, and runs a failing `withSpan('db.query', ...)`.
 
-**consola's BasicReporter** (Node, not a terminal), reporters wrapped with `withContextFields()`, stack shortened:
+**consola's BasicReporter** (Node, not a terminal), reporters wrapped with `contextFieldsReporter()`, stack shortened:
 
 ```text
 [info] request.start GET /orders/42 { requestId: 'req-1',
@@ -282,10 +282,10 @@ consola ships no JSON reporter. This one writes each line as one JSON line, the 
 
 A line from `fromConsola()` is written as loggercf routed it. Your own `consola.info(...)` calls go through loggercf's Argument Routing (the `printf` message, objects merged, the first `Error` to `err` and the rest to `errors`, other values to `args`). It never throws: a line it can't write is written as `time`, `level` and `logError`.
 
-## `withContextFields(reporter)`
+## `contextFieldsReporter(reporter)`
 
 ```ts
-function withContextFields<O extends ConsolaLogObjectLike, C>(
+function contextFieldsReporter<O extends ConsolaLogObjectLike, C>(
   reporter: ConsolaReporterLike<O, C>,
 ): ConsolaReporterLike<O, C>
 ```
@@ -294,9 +294,9 @@ Wraps any consola reporter so your direct consola calls inside a Logging Context
 
 ```ts
 import { consola } from 'consola'
-import { withContextFields } from 'loggercf/consola'
+import { contextFieldsReporter } from 'loggercf/consola'
 
-consola.setReporters(consola.options.reporters.map(withContextFields))
+consola.setReporters(consola.options.reporters.map(contextFieldsReporter))
 ```
 
 ## consola's throttle

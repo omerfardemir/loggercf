@@ -5,13 +5,15 @@ import { currentContextFields } from '../core/logger'
 import {
   defaultErrorShape,
   describeFailure,
+  invalidResult,
   isError,
   isPlainObject,
   takeRecordKeys,
+  thenableFailure,
   TRACE_KEYS,
   type LogRecord,
 } from '../output/output'
-import type { LogFields, Logger, LogLevel } from '../core/types'
+import type { ErrorSerializer, LogFields, Logger, LogLevel } from '../core/types'
 
 /**
  * A winston info object: what a winston logger writes and its formats transform.
@@ -65,14 +67,18 @@ export interface FromWinstonOptions {
    */
   levels?: Partial<Record<LogLevel, string>>
   /**
-   * Writes each `Error` on the adapter's lines, at any depth inside plain objects and
-   * arrays, in place of loggercf's default shape (`{ type, message, stack, ...own
-   * props, cause? }`), which `defaultSerialize` gives. What it returns is handed to
-   * winston as it is: return the `Error` itself for a format of yours that writes
-   * Errors. When it throws, that `Error` is written in the default shape with
-   * `serializeErrorFailed`.
+   * The Error Serializer for the adapter's lines, with the same rules as the
+   * `serializeError` Logger Option (so `omitErrorKeys()` works here too): it writes each
+   * `Error`, at any depth inside plain objects and arrays, in place of loggercf's
+   * default shape, which `defaultSerialize` gives (with `cause` already in the default
+   * shape). An `Error` inside what it returns goes through it again, and is
+   * `"[Circular]"` where it loops. Returning the `Error` itself writes its default
+   * shape. When it throws, or returns anything but an object (a Promise included),
+   * that `Error` is written in the default shape with `serializeErrorFailed`; one that
+   * returned a Promise is not called again. It applies to the lines `fromWinston()`
+   * writes, not to your direct winston calls.
    */
-  writeError?: (err: Error, defaultSerialize: (err: Error) => LogRecord) => unknown
+  serializeError?: ErrorSerializer
 }
 
 /** winston's own key for the level, which its transports filter on (triple-beam's `LEVEL`). */
@@ -83,9 +89,9 @@ const SPLAT = Symbol.for('splat')
 
 /**
  * Set on the lines `fromWinston()` writes, which already carry their Context Fields
- * and trace IDs: `contextFields()` leaves them as they are.
+ * and trace IDs: `contextFieldsFormat()` leaves them as they are.
  */
-const STAMPED = Symbol.for('loggercf.contextFields')
+const FROM_WINSTON = Symbol.for('loggercf.fromWinston')
 
 /** What an object inside itself is written as, as winston's `format.json()` writes it. */
 const CIRCULAR = '[Circular]'
@@ -139,7 +145,7 @@ function mapLevels(
     if (given !== undefined) {
       if (!has(given))
         throw new TypeError(
-          `fromWinston: levels.${level}: '${given}' is not one of the winston logger's levels (${Object.keys(levels).join(', ')})`,
+          `fromWinston(): levels.${level}: '${given}' is not one of the winston logger's levels (${Object.keys(levels).join(', ')})`,
         )
       mapping[level] = given
       continue
@@ -147,7 +153,7 @@ function mapLevels(
     const found = CANDIDATES[level].find(has)
     if (found === undefined)
       throw new TypeError(
-        `fromWinston: the winston logger has no level for loggercf's '${level}' (tried ${CANDIDATES[level].join(', ')}); map it with the levels option`,
+        `fromWinston(): the winston logger has no level for loggercf's '${level}' (tried ${CANDIDATES[level].join(', ')}); map it with the levels option`,
       )
     mapping[level] = found
   }
@@ -211,7 +217,7 @@ function withErrorsWritten(
 }
 
 /**
- * loggercf's default shape for one `Error`, as `writeError` gets it.
+ * loggercf's default shape for one `Error`, as `serializeError` gets it.
  *
  * @param {Error} err - The `Error`.
  * @returns {LogRecord} `{ type, message, stack, ...own props, cause? }`.
@@ -219,29 +225,55 @@ function withErrorsWritten(
 const defaultSerialize = (err: Error): LogRecord => defaultErrorShape(err)
 
 /**
- * The function that writes each `Error` of one line: the `writeError` option, or
- * loggercf's default shape. The same `Error` twice on a line is written once.
+ * An `Error` whose serializer failed: the default shape, with why.
  *
- * @param {FromWinstonOptions['writeError']} custom - The `writeError` option.
+ * @param {Error} err - The `Error`.
+ * @param {string} reason - Why the serializer's result was not written.
+ * @returns {LogRecord} The default shape with `serializeErrorFailed`.
+ */
+const failed = (err: Error, reason: string): LogRecord => ({
+  ...defaultSerialize(err),
+  serializeErrorFailed: reason,
+})
+
+/**
+ * The function that writes each `Error` of one line: the `serializeError` option, by
+ * the Error Serializer's rules, or loggercf's default shape. The same `Error` twice on
+ * a line is written once.
+ *
+ * @param {ErrorSerializer} [custom] - The `serializeError` option.
  * @returns {(err: Error) => unknown} The writer, for one line.
  */
-function errorWriter(custom: FromWinstonOptions['writeError']): (err: Error) => unknown {
+function errorWriter(custom: ErrorSerializer | undefined): (err: Error) => unknown {
   const written = new Map<Error, unknown>()
-  return (err) => {
+  const write = (err: Error): unknown => {
     if (written.has(err)) return written.get(err)
+    if (!custom) {
+      const out = defaultSerialize(err)
+      written.set(err, out)
+      return out
+    }
+    // While its serializer runs, the `Error` is "[Circular]" inside what it returns.
+    written.set(err, CIRCULAR)
     let out: unknown
-    if (custom) {
-      try {
-        out = custom(err, defaultSerialize)
-      } catch (thrown) {
-        out = { ...defaultSerialize(err), serializeErrorFailed: describeFailure(thrown) }
-      }
+    const skipped = thenableFailure(custom)
+    if (skipped) {
+      out = failed(err, skipped)
     } else {
-      out = defaultSerialize(err)
+      try {
+        const result = custom(err, defaultSerialize)
+        const invalid = invalidResult(result, custom)
+        if (invalid) out = failed(err, invalid)
+        else if (isError(result)) out = defaultSerialize(result)
+        else out = withErrorsWritten(result, write, new Set())
+      } catch (thrown) {
+        out = failed(err, describeFailure(thrown))
+      }
     }
     written.set(err, out)
     return out
   }
+  return write
 }
 
 /**
@@ -299,7 +331,7 @@ function toInfo(
   info[LEVEL] = level
   // An empty splat: `format.splat()` reads it (over a `splat` field), so it never formats the message again.
   info[SPLAT] = []
-  info[STAMPED] = true
+  info[FROM_WINSTON] = true
   return info
 }
 
@@ -336,7 +368,7 @@ function toInfo(
  * @example
  * ```ts
  * const w = winston.createLogger({
- *   format: winston.format.combine(contextFields(), winston.format.json()),
+ *   format: winston.format.combine(contextFieldsFormat(), winston.format.json()),
  *   transports: [new winston.transports.Console()],
  * })
  * app.use(useLogger(fromWinston(w)))
@@ -347,12 +379,12 @@ export function fromWinston<T extends LogFields = LogFields>(
   options: FromWinstonOptions = {},
 ): Logger<T> {
   const levels = mapLevels(logger.levels ?? NPM_LEVELS, options.levels ?? {})
-  const { writeError } = options
+  const { serializeError } = options
   return adaptLogger<T>({
     write(line) {
       const level = levels[line.level]
       if (typeof logger.isLevelEnabled === 'function' && !logger.isLevelEnabled(level)) return
-      logger.write(toInfo(line, level, logger.defaultMeta, errorWriter(writeError)))
+      logger.write(toInfo(line, level, logger.defaultMeta, errorWriter(serializeError)))
     },
   })
 }
@@ -382,22 +414,22 @@ function contextEntries(): LogRecord {
  * write at once (`Console`, `Stream`), that is during the call. Behind one that
  * doesn't (`File`, `Http`), winston buffers a burst of lines and formats them later,
  * in whatever Logging Context is current then, so they could carry another unit of
- * work's fields: there, use `contextMeta()` instead, which is read at the call.
+ * work's fields: there, use `contextFieldsDefaultMeta()` instead, which is read at the call.
  *
  * @returns {WinstonFormat} The format, for `format.combine()` or `createLogger({ format })`.
  *
  * @example
  * ```ts
  * const w = winston.createLogger({
- *   format: winston.format.combine(contextFields(), winston.format.json()),
+ *   format: winston.format.combine(contextFieldsFormat(), winston.format.json()),
  *   transports: [new winston.transports.Console()],
  * })
  * ```
  */
-export function contextFields(): WinstonFormat {
+export function contextFieldsFormat(): WinstonFormat {
   return {
     transform(info) {
-      if (info[STAMPED] === true) return info
+      if (info[FROM_WINSTON] === true) return info
       const fields = contextEntries()
       for (const key of Object.keys(fields)) {
         if (!Object.hasOwn(info, key)) setOwn(info, key, fields[key])
@@ -411,7 +443,7 @@ export function contextFields(): WinstonFormat {
  * A winston `defaultMeta` whose keys are the current Logging Context's Context Fields
  * and trace IDs, read each time winston copies it: during the log call, so each line
  * carries its own unit of work's fields whatever its transports do (see
- * `contextFields()`). `fields` are written on every line too, over the Context Fields
+ * `contextFieldsFormat()`). `fields` are written on every line too, over the Context Fields
  * (as a Root Logger's bindings are); the trace IDs are over both.
  *
  * Which wins between it and a call's own fields is winston's rule for `defaultMeta`:
@@ -423,13 +455,15 @@ export function contextFields(): WinstonFormat {
  * @example
  * ```ts
  * const w = winston.createLogger({
- *   defaultMeta: contextMeta({ service: 'api' }),
+ *   defaultMeta: contextFieldsDefaultMeta({ service: 'api' }),
  *   format: winston.format.json(),
  *   transports: [new winston.transports.File({ filename: 'app.log' })],
  * })
  * ```
  */
-export function contextMeta(fields: Record<string, unknown> = {}): Record<string, unknown> {
+export function contextFieldsDefaultMeta(
+  fields: Record<string, unknown> = {},
+): Record<string, unknown> {
   const fixed: LogRecord = {}
   for (const [key, value] of Object.entries(fields)) setOwn(fixed, key, value)
   const current = (): LogRecord => {

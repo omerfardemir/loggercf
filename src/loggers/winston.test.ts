@@ -1,5 +1,5 @@
-// `loggercf/winston` with a real winston logger: fromWinston(), the contextFields() format
-// and contextMeta(), and loggercf's own lines written through winston.
+// `loggercf/winston` with a real winston logger: fromWinston(), the contextFieldsFormat() format
+// and contextFieldsDefaultMeta(), and loggercf's own lines written through winston.
 import { describe, it, expect, vi, beforeEach, expectTypeOf } from 'vitest'
 import { Writable } from 'node:stream'
 import winston from 'winston'
@@ -38,8 +38,8 @@ vi.mock('cloudflare:workers', () => ({
 import { WorkerEntrypoint } from 'cloudflare:workers'
 import { Hono } from 'hono'
 import {
-  contextFields,
-  contextMeta,
+  contextFieldsFormat,
+  contextFieldsDefaultMeta,
   fromWinston,
   type WinstonFormat,
   type WinstonInfo,
@@ -53,6 +53,7 @@ import {
   setLoggerContext,
   withSpan,
 } from '../core/logger'
+import { omitErrorKeys } from '../output/omit'
 import { useLogger } from '../hono/middleware'
 import { withLogging, withScheduled } from '../workers'
 import type { Logger } from '../core/types'
@@ -64,7 +65,7 @@ const Transport = (winston as unknown as { Transport: new () => winston.transpor
 
 /**
  * A winston logger writing to memory through a Stream transport, as JSON, with the
- * `contextFields()` format. `options` replace the defaults.
+ * `contextFieldsFormat()` format. `options` replace the defaults.
  */
 function memoryWinston(options: winston.LoggerOptions = {}) {
   const out: string[] = []
@@ -76,7 +77,7 @@ function memoryWinston(options: winston.LoggerOptions = {}) {
   })
   const w = winston.createLogger({
     level: 'silly',
-    format: winston.format.combine(contextFields(), winston.format.json()),
+    format: winston.format.combine(contextFieldsFormat(), winston.format.json()),
     transports: [new winston.transports.Stream({ stream })],
     ...options,
   })
@@ -121,10 +122,13 @@ describe('loggercf/winston', () => {
       expectTypeOf(fromWinston(w.child({ module: 'db' }))).toEqualTypeOf<Logger>()
     })
 
-    it('contextFields() is a winston Format, and contextMeta() a defaultMeta', () => {
-      expectTypeOf(contextFields()).toExtend<winston.Logform.Format>()
-      expectTypeOf(winston.format.combine).toBeCallableWith(contextFields(), winston.format.json())
-      expectTypeOf(contextMeta()).toExtend<winston.LoggerOptions['defaultMeta']>()
+    it('contextFieldsFormat() is a winston Format, and contextFieldsDefaultMeta() a defaultMeta', () => {
+      expectTypeOf(contextFieldsFormat()).toExtend<winston.Logform.Format>()
+      expectTypeOf(winston.format.combine).toBeCallableWith(
+        contextFieldsFormat(),
+        winston.format.json(),
+      )
+      expectTypeOf(contextFieldsDefaultMeta()).toExtend<winston.LoggerOptions['defaultMeta']>()
     })
   })
 
@@ -200,9 +204,9 @@ describe('loggercf/winston', () => {
 
       it("doesn't build a line winston would not write: its Errors are not serialized", () => {
         const { w } = memoryWinston({ level: 'info' })
-        const writeError = vi.fn((err: Error) => err.message)
-        fromWinston(w, { writeError }).debug(new Error('hidden'))
-        expect(writeError).not.toHaveBeenCalled()
+        const serializeError = vi.fn((err: Error) => ({ message: err.message }))
+        fromWinston(w, { serializeError }).debug(new Error('hidden'))
+        expect(serializeError).not.toHaveBeenCalled()
       })
     })
 
@@ -300,10 +304,10 @@ describe('loggercf/winston', () => {
         })
       })
 
-      it('writes each Error with your writeError, given the default shape too', () => {
+      it('writes each Error with your serializeError, given the default shape too', () => {
         const { w, lines } = memoryWinston()
         const logger = fromWinston(w, {
-          writeError: (err, defaultSerialize) => {
+          serializeError: (err, defaultSerialize) => {
             const { stack: _stack, ...rest } = defaultSerialize(err)
             return { ...rest, code: 'E1' }
           },
@@ -312,18 +316,74 @@ describe('loggercf/winston', () => {
         expect(lines()[0]!.err).toEqual({ type: 'Error', message: 'boom', code: 'E1' })
       })
 
-      it('hands winston the Error itself when your writeError returns it', () => {
-        const infos: WinstonInfo[] = []
-        const err = new Error('raw')
-        const target: WinstonLike = { write: (info) => void infos.push(info) }
-        fromWinston(target, { writeError: (e) => e }).error(err)
-        expect(infos[0]!.err).toBe(err)
+      it('writes the default shape when your serializeError returns the Error itself, as the core does', () => {
+        const { w, lines } = memoryWinston()
+        // Not what its type allows, but the core writes it, and so does fromWinston.
+        fromWinston(w, { serializeError: ((e: Error) => e) as never }).error(new Error('raw'))
+        expect(lines()[0]!.err).toMatchObject({ type: 'Error', message: 'raw' })
+        expect(lines()[0]!.err).toHaveProperty('stack')
       })
 
-      it('writes the default shape with serializeErrorFailed when your writeError throws', () => {
+      it('writes an Error inside what your serializeError returns through it again', () => {
+        const { w, lines } = memoryWinston()
+        const inner = new TypeError('inner')
+        fromWinston(w, {
+          serializeError: (err) =>
+            err === inner ? { message: 'inner, serialized' } : { message: err.message, inner },
+        }).error(new Error('outer'))
+        expect(lines()[0]!.err).toEqual({
+          message: 'outer',
+          inner: { message: 'inner, serialized' },
+        })
+      })
+
+      it('writes "[Circular]" where what your serializeError returns holds its own Error', () => {
+        const { w, lines } = memoryWinston()
+        fromWinston(w, { serializeError: (err) => ({ message: err.message, self: err }) }).error(
+          new Error('loop'),
+        )
+        expect(lines()[0]!.err).toEqual({ message: 'loop', self: '[Circular]' })
+      })
+
+      it('writes the default shape with serializeErrorFailed when your serializeError returns no object', () => {
+        const { w, lines } = memoryWinston()
+        fromWinston(w, { serializeError: () => undefined as never }).error(new Error('boom'))
+        expect(lines()[0]!.err).toMatchObject({
+          type: 'Error',
+          message: 'boom',
+          serializeErrorFailed: 'serializeError returned undefined',
+        })
+      })
+
+      it('writes the default shape with serializeErrorFailed when your serializeError is async, and calls it no more', () => {
+        const { w, lines } = memoryWinston()
+        const serializeError = vi.fn(async (err: Error) => ({ message: err.message })) as never
+        const logger = fromWinston(w, { serializeError })
+        logger.error(new Error('one'))
+        logger.error(new Error('two'))
+        expect(lines()[0]!.err).toMatchObject({
+          message: 'one',
+          serializeErrorFailed: 'serializeError returned a Promise',
+        })
+        expect(lines()[1]!.err).toMatchObject({
+          message: 'two',
+          serializeErrorFailed: 'serializeError returned a Promise',
+        })
+        expect(serializeError).toHaveBeenCalledTimes(1)
+      })
+
+      it("takes the core's serializers: omitErrorKeys", () => {
+        const { w, lines } = memoryWinston()
+        const err = Object.assign(new Error('boom'), { body: 'secret', code: 'E1' })
+        fromWinston(w, { serializeError: omitErrorKeys(['body']) }).error(err)
+        expect(lines()[0]!.err).toMatchObject({ message: 'boom', code: 'E1', omitted: ['body'] })
+        expect(lines()[0]!.err).not.toHaveProperty('body')
+      })
+
+      it('writes the default shape with serializeErrorFailed when your serializeError throws', () => {
         const { w, lines } = memoryWinston()
         const logger = fromWinston(w, {
-          writeError: () => {
+          serializeError: () => {
             throw new RangeError('bad serializer')
           },
         })
@@ -461,7 +521,7 @@ describe('loggercf/winston', () => {
     })
   })
 
-  describe('contextFields()', () => {
+  describe('contextFieldsFormat()', () => {
     it("adds the Context Fields and trace IDs to winston's own calls inside a Logging Context", () => {
       const { w, lines } = memoryWinston()
       runWithLogger({ logger: fromWinston(w), fields: { requestId: 'r-1' } }, () => {
@@ -508,7 +568,7 @@ describe('loggercf/winston', () => {
       const { w, lines } = memoryWinston({
         format: winston.format.combine(
           winston.format.timestamp(),
-          contextFields(),
+          contextFieldsFormat(),
           winston.format.label({ label: 'api' }),
           winston.format.json(),
         ),
@@ -525,7 +585,7 @@ describe('loggercf/winston', () => {
     it('adds nothing to a line fromWinston wrote, even when winston formats it later, elsewhere', async () => {
       const { transport, infos } = slowTransport()
       const w = winston.createLogger({
-        format: winston.format.combine(contextFields(), winston.format.json()),
+        format: winston.format.combine(contextFieldsFormat(), winston.format.json()),
         transports: [transport],
       })
       const logger = fromWinston(w)
@@ -538,10 +598,10 @@ describe('loggercf/winston', () => {
     })
   })
 
-  describe('contextMeta()', () => {
+  describe('contextFieldsDefaultMeta()', () => {
     it("adds the Context Fields and trace IDs to winston's own calls, at the call", () => {
       const { w, lines } = memoryWinston({
-        defaultMeta: contextMeta(),
+        defaultMeta: contextFieldsDefaultMeta(),
         format: winston.format.json(),
       })
       runWithLogger({ logger: fromWinston(w), fields: { requestId: 'r-1' } }, () => {
@@ -563,7 +623,10 @@ describe('loggercf/winston', () => {
 
     it('writes each line with its own Logging Context, even behind a slow transport', async () => {
       const { transport, infos } = slowTransport()
-      const w = winston.createLogger({ defaultMeta: contextMeta(), transports: [transport] })
+      const w = winston.createLogger({
+        defaultMeta: contextFieldsDefaultMeta(),
+        transports: [transport],
+      })
       const logger = fromWinston(w)
       for (let i = 0; i < 40; i++) {
         runWithLogger({ logger, fields: { requestId: `r-${i}` } }, () => w.info('line', { i }))
@@ -576,7 +639,7 @@ describe('loggercf/winston', () => {
 
     it('keeps its own fields, over the Context Fields, with the trace IDs over both', () => {
       const { w, lines } = memoryWinston({
-        defaultMeta: contextMeta({ service: 'api', region: 'eu', traceId: 'fixed' }),
+        defaultMeta: contextFieldsDefaultMeta({ service: 'api', region: 'eu', traceId: 'fixed' }),
         format: winston.format.json(),
       })
       runWithLogger({ logger: fromWinston(w), fields: { region: 'ctx', requestId: 'r-1' } }, () =>
@@ -597,7 +660,7 @@ describe('loggercf/winston', () => {
 
     it('reads its own fields once, when it is made', () => {
       const base = { service: 'api' }
-      const meta = contextMeta(base)
+      const meta = contextFieldsDefaultMeta(base)
       base.service = 'changed'
       expect({ ...meta }).toEqual({ service: 'api' })
     })
@@ -726,7 +789,7 @@ describe('loggercf/winston', () => {
   })
 
   it('a format is just a transform', () => {
-    const format: WinstonFormat = contextFields()
+    const format: WinstonFormat = contextFieldsFormat()
     const info: WinstonInfo = { level: 'info', message: 'm' }
     expect(format.transform(info)).toBe(info)
   })

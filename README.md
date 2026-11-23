@@ -17,8 +17,8 @@ pnpm add hono
 | `loggercf`         | Core: `createLogger`, `runWithLogger`, `withSpan`, `getLogger`, `setDefaultLogger`, `setLoggerContext`, `loggerOptionsFromEnv`, `tracedFetch`, `tracedFetcher`, `currentContextFields`, `adaptLogger`, trace utilities, types |
 | `loggercf/hono`    | `useLogger`, `generateId` — Hono middleware; `UseLoggerOptions`, `RequestIdOptions`, `RequestIdSource` types                                                                                                                  |
 | `loggercf/workers` | `TracedSession`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withTrace`, `tracedSession`, `defaultLoggerFromEnv`, `withScheduled`, `withQueueMessage`, `withWorkflow`, `tracedStep`                                   |
-| `loggercf/winston` | `fromWinston`, `contextFields`, `contextMeta` — [winston as your own logger](#your-own-logger-pino-winston-consola)                                                                                                           |
-| `loggercf/consola` | `fromConsola`, `withContextFields`, `jsonReporter` — [consola as your own logger](#your-own-logger-pino-winston-consola)                                                                                                      |
+| `loggercf/winston` | `fromWinston`, `contextFieldsFormat`, `contextFieldsDefaultMeta` — [winston as your own logger](#your-own-logger-pino-winston-consola)                                                                                        |
+| `loggercf/consola` | `fromConsola`, `contextFieldsReporter`, `jsonReporter` — [consola as your own logger](#your-own-logger-pino-winston-consola)                                                                                                  |
 
 ## How Trace Propagation Works
 
@@ -1385,12 +1385,12 @@ Only the final write differs, detected at startup:
 
 loggercf's built-in logger is the default, but the Cloudflare parts (Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers) work with a logger you already use. Pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own included, so all lines share one output and one format.
 
-| Logger  | Adapter                                                     | Context Fields on its lines                                                                                       | Recipe                                             |
-| ------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| pino    | none: pass the pino logger as it is                         | `mixin: currentContextFields`                                                                                     | [docs/loggers/pino.md](docs/loggers/pino.md)       |
-| winston | `fromWinston(logger)` from `loggercf/winston`               | added by `fromWinston` during each call; `contextMeta()` or the `contextFields()` format for direct winston calls | [docs/loggers/winston.md](docs/loggers/winston.md) |
-| consola | `fromConsola(consola)` from `loggercf/consola`              | added by `fromConsola`; `withContextFields(reporter)` or `jsonReporter()` for direct consola calls                | [docs/loggers/consola.md](docs/loggers/consola.md) |
-| other   | [`adaptLogger(target)`](#adaptloggertarget) from `loggercf` | [`currentContextFields()`](#currentcontextfields) in your `write`                                                 | below                                              |
+| Logger  | Adapter                                                     | Context Fields on its lines                                                                                                          | Recipe                                             |
+| ------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------- |
+| pino    | none: pass the pino logger as it is                         | `mixin: currentContextFields`                                                                                                        | [docs/loggers/pino.md](docs/loggers/pino.md)       |
+| winston | `fromWinston(logger)` from `loggercf/winston`               | added by `fromWinston` during each call; `contextFieldsDefaultMeta()` or the `contextFieldsFormat()` format for direct winston calls | [docs/loggers/winston.md](docs/loggers/winston.md) |
+| consola | `fromConsola(consola)` from `loggercf/consola`              | added by `fromConsola`; `contextFieldsReporter(reporter)` or `jsonReporter()` for direct consola calls                               | [docs/loggers/consola.md](docs/loggers/consola.md) |
+| other   | [`adaptLogger(target)`](#adaptloggertarget) from `loggercf` | [`currentContextFields()`](#currentcontextfields) in your `write`                                                                    | below                                              |
 
 The adapters import nothing from winston or consola, at runtime or in their types: they work with the version you installed.
 
@@ -1462,7 +1462,7 @@ It adds nothing of its own: no time, no level filter, no Context Fields (add `cu
 
 ### What doesn't apply
 
-The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes a `writeError` for loggercf's lines). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
+The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes the same `serializeError` for the lines it writes). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
 
 ### Workers caveats
 

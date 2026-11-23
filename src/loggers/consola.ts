@@ -77,7 +77,7 @@ export interface ConsolaReporterLike<
 /**
  * What `fromConsola()` keeps on each log object it hands consola, keyed by a symbol so
  * consola's reporters never print it: the line as `adaptLogger()` routed it, and the
- * Logging Context it was written in. `withContextFields()` sees from it that the
+ * Logging Context it was written in. `contextFieldsReporter()` sees from it that the
  * Context Fields are already there; `jsonReporter()` writes the line from it.
  */
 interface ConsolaLine {
@@ -272,10 +272,10 @@ export function fromConsola<T extends LogFields = LogFields>(consola: ConsolaLik
  * ```ts
  * import { consola } from 'consola'
  *
- * consola.setReporters(consola.options.reporters.map(withContextFields))
+ * consola.setReporters(consola.options.reporters.map(contextFieldsReporter))
  * ```
  */
-export function withContextFields<O extends ConsolaLogObjectLike, C>(
+export function contextFieldsReporter<O extends ConsolaLogObjectLike, C>(
   reporter: ConsolaReporterLike<O, C>,
 ): ConsolaReporterLike<O, C> {
   return {

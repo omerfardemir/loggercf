@@ -3,8 +3,8 @@
 Keep winston, with its transports and formats, and use it as Your Own Logger: loggercf's own lines (Request Lines, `span.end`, failure lines) and your `getLogger()` calls all go through it, so every line shares one output and one format. `loggercf/winston` is the thin part in between:
 
 - `fromWinston(w)`: a loggercf `Logger` over a winston logger, to pass anywhere loggercf takes a Root Logger.
-- `contextFields()`: a winston format that adds the current Logging Context's Context Fields and trace IDs to your direct winston calls (`w.info(...)`).
-- `contextMeta()`: the same fields as a winston `defaultMeta`, read during the call, for transports that write later (`File`, `Http`).
+- `contextFieldsFormat()`: a winston format that adds the current Logging Context's Context Fields and trace IDs to your direct winston calls (`w.info(...)`).
+- `contextFieldsDefaultMeta()`: the same fields as a winston `defaultMeta`, read during the call, for transports that write later (`File`, `Http`).
 
 `loggercf/winston` imports nothing from winston: winston stays your dependency, at your version.
 
@@ -18,17 +18,17 @@ On Workers, winston needs the `nodejs_compat` compatibility flag (see [Workers c
 
 ## The winston logger
 
-Build it once, at module scope, as you would without loggercf. Add `contextFields()` before `format.json()`:
+Build it once, at module scope, as you would without loggercf. Add `contextFieldsFormat()` before `format.json()`:
 
 ```ts
 import winston from 'winston'
-import { contextFields, fromWinston } from 'loggercf/winston'
+import { contextFieldsFormat, fromWinston } from 'loggercf/winston'
 
 export const w = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
-    contextFields(),
+    contextFieldsFormat(),
     winston.format.json(),
   ),
   transports: [
@@ -97,7 +97,7 @@ To build it from env, pass a function of env. It is called once per env, so the 
 
 ```ts
 import winston from 'winston'
-import { contextFields, fromWinston } from 'loggercf/winston'
+import { contextFieldsFormat, fromWinston } from 'loggercf/winston'
 import { withScheduled } from 'loggercf/workers'
 
 export default {
@@ -107,7 +107,7 @@ export default {
         winston.createLogger({
           level: env.LOG_LEVEL ?? 'info',
           defaultMeta: { service: env.NAME },
-          format: winston.format.combine(contextFields(), winston.format.json()),
+          format: winston.format.combine(contextFieldsFormat(), winston.format.json()),
           transports: [new winston.transports.Console()],
         }),
       ),
@@ -181,20 +181,20 @@ And `request.end` for a handler that threw (stack shortened):
 
 **`format.splat()` doesn't format it again.** Each info object carries an empty splat, so a `%` in the formatted message (`logger.info('%s', '100%s done')`) stays as it is, and a field named `splat` is only a field.
 
-**Errors are written, not `{}`.** `format.json()` writes an `Error` as `{}`, and `format.errors()` only looks at the info object itself or its `message`. So `fromWinston` writes every `Error` in the line's fields (`err`, `errors`, and inside plain objects and arrays at any depth) in loggercf's default shape, `{ type, message, stack, ...own props, cause? }`, before winston sees it. Your objects are not changed: what holds an `Error` is copied. An object inside itself is `"[Circular]"` there. Pass `writeError` to write them your way:
+**Errors are written, not `{}`.** `format.json()` writes an `Error` as `{}`, and `format.errors()` only looks at the info object itself or its `message`. So `fromWinston` writes every `Error` in the line's fields (`err`, `errors`, and inside plain objects and arrays at any depth) in loggercf's default shape, `{ type, message, stack, ...own props, cause? }`, before winston sees it. Your objects are not changed: what holds an `Error` is copied. An object inside itself is `"[Circular]"` there. Pass `serializeError`, the same Error Serializer the built-in logger takes (`omitErrorKeys([...])` works too), to write them your way:
 
 ```ts
 const logger = fromWinston(w, {
-  writeError: (err, defaultSerialize) => {
+  serializeError: (err, defaultSerialize) => {
     const { stack, ...rest } = defaultSerialize(err)
     return rest
   },
 })
 ```
 
-What it returns goes to winston as it is: return `err` itself if a format of yours writes Errors. When it throws, that `Error` is written in the default shape with `serializeErrorFailed`.
+It has the built-in logger's rules. An `Error` inside what it returns goes through it again (`"[Circular]"` where it loops), and returning `err` itself writes its default shape. When it throws, or returns anything but an object (a Promise included), that `Error` is written in the default shape with `serializeErrorFailed`, and one that returned a Promise is not called again. `defaultSerialize(err)` gives `cause` already in the default shape. It applies to the lines `fromWinston` writes; for your direct winston calls use `format.errors()` or a format of your own.
 
-**Context Fields at the call.** Each line carries the current Logging Context's Context Fields and trace IDs, taken during the call, with or without `contextFields()` in your format. Strongest first: the trace IDs, the call's fields, the bindings of `logger.child(...)`, winston's `defaultMeta`, the Context Fields. A binding or Context Field named `level` or `message` moves to `args`, so it can't change the line's level or message.
+**Context Fields at the call.** Each line carries the current Logging Context's Context Fields and trace IDs, taken during the call, with or without `contextFieldsFormat()` in your format. Strongest first: the trace IDs, the call's fields, the bindings of `logger.child(...)`, winston's `defaultMeta`, the Context Fields. A binding or Context Field named `level` or `message` moves to `args`, so it can't change the line's level or message.
 
 **`child`.** `logger.child(bindings)` keeps the bindings in the adapter and writes them on each line, so they win over `defaultMeta` and the Context Fields, as loggercf's bindings do. To adapt a winston child, `fromWinston(w.child({ module: 'db' }))` works too; winston writes its child's fields under everything else on the line.
 
@@ -237,20 +237,20 @@ const logger = fromWinston(w, { levels: { trace: 'verbose', info: 'http' } })
 
 `fromWinston`'s lines carry the Context Fields by themselves. For your own `w.info(...)` calls, add one of these to the winston logger.
 
-### contextFields(), the format
+### contextFieldsFormat(), the format
 
 Adds the Context Fields and trace IDs to each line inside a Logging Context, and nothing outside one. A key the line already has keeps the line's value. Put it in `format.combine(...)` before the format that writes the line (`json()`, `logstash()`, `printf(...)`).
 
-A format runs when winston formats the line. With `Console` and `Stream` transports, which finish each write at once, that is during the call. Behind a transport that writes later (`File`, `Http`), winston buffers a burst of lines and formats them afterwards, in whatever Logging Context is current then: in a test with 60 lines behind a transport that finished each write a tick later, 28 of them carried another request's fields. `fromWinston`'s own lines are safe from this (the format leaves them as they are), but your direct calls are not. Use `contextMeta()` there.
+A format runs when winston formats the line. With `Console` and `Stream` transports, which finish each write at once, that is during the call. Behind a transport that writes later (`File`, `Http`), winston buffers a burst of lines and formats them afterwards, in whatever Logging Context is current then: in a test with 60 lines behind a transport that finished each write a tick later, 28 of them carried another request's fields. `fromWinston`'s own lines are safe from this (the format leaves them as they are), but your direct calls are not. Use `contextFieldsDefaultMeta()` there.
 
-### contextMeta(), the defaultMeta
+### contextFieldsDefaultMeta(), the defaultMeta
 
 ```ts
 import winston from 'winston'
-import { contextMeta } from 'loggercf/winston'
+import { contextFieldsDefaultMeta } from 'loggercf/winston'
 
 const w = winston.createLogger({
-  defaultMeta: contextMeta({ service: 'api' }),
+  defaultMeta: contextFieldsDefaultMeta({ service: 'api' }),
   format: winston.format.json(),
   transports: [new winston.transports.File({ filename: 'app.log' })],
 })
@@ -262,14 +262,14 @@ winston copies `defaultMeta` into each line during the call, so each line carrie
 
 The Logger Options configure loggercf's built-in logger, not winston. With your winston logger:
 
-| Logger Option                                                 | With winston                                                                                                             |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `level`, `LOG_LEVEL`                                          | winston's `level` (and each transport's). Read it from env in a function of env, as above.                               |
-| `service`, `environment`, `version`                           | winston's `defaultMeta`, or `contextMeta({ service })`.                                                                  |
-| Span Defaults (`spans`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`) | None: each Span is at `info` unless its own `level` / `slowMs` options say otherwise.                                    |
-| `serializeError` (Error Serializer)                           | `fromWinston`'s `writeError` option, for loggercf's lines. Your direct calls: `format.errors()` or a format of your own. |
-| `limits` (Line Limits)                                        | None in winston: write a format that cuts long values.                                                                   |
-| `redact` (Redactor)                                           | A format of your own that replaces values before `format.json()`.                                                        |
+| Logger Option                                                 | With winston                                                                                                                                      |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `level`, `LOG_LEVEL`                                          | winston's `level` (and each transport's). Read it from env in a function of env, as above.                                                        |
+| `service`, `environment`, `version`                           | winston's `defaultMeta`, or `contextFieldsDefaultMeta({ service })`.                                                                              |
+| Span Defaults (`spans`, `LOG_SPAN_LEVEL`, `LOG_SPAN_SLOW_MS`) | None: each Span is at `info` unless its own `level` / `slowMs` options say otherwise.                                                             |
+| `serializeError` (Error Serializer)                           | `fromWinston`'s `serializeError` option, with the same rules, for loggercf's lines. Your direct calls: `format.errors()` or a format of your own. |
+| `limits` (Line Limits)                                        | None in winston: write a format that cuts long values.                                                                                            |
+| `redact` (Redactor)                                           | A format of your own that replaces values before `format.json()`.                                                                                 |
 
 ## Workers caveats
 
@@ -312,6 +312,6 @@ export default { ...util, debuglog }
 }
 ```
 
-**Transports.** Use `Console`. In workerd there is no `console._stdout`, so it writes each line with `console.log`, and with `console.error` / `console.warn` only for the levels in its `stderrLevels` / `consoleWarnLevels`: set them (as in the logger above), or Workers Logs records every line at the `log` level. It finishes each write at once, so `contextFields()` is safe there. The `File` and `Http` transports were not tried in workerd, and a Worker has no lasting disk for a file: to ship lines elsewhere, use Workers Logs, Logpush or a Tail Worker.
+**Transports.** Use `Console`. In workerd there is no `console._stdout`, so it writes each line with `console.log`, and with `console.error` / `console.warn` only for the levels in its `stderrLevels` / `consoleWarnLevels`: set them (as in the logger above), or Workers Logs records every line at the `log` level. It finishes each write at once, so `contextFieldsFormat()` is safe there. The `File` and `Http` transports were not tried in workerd, and a Worker has no lasting disk for a file: to ship lines elsewhere, use Workers Logs, Logpush or a Tail Worker.
 
 **Each line costs a `setImmediate`.** The `Console` transport emits its `logged` event on the next turn, which `nodejs_compat` provides.

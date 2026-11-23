@@ -33,7 +33,7 @@ import { createConsola as createBrowserConsola } from 'consola/browser'
 import { createConsola as createBasicConsola } from 'consola/basic'
 import { createConsola as createCoreConsola } from 'consola/core'
 import { Hono } from 'hono'
-import { fromConsola, jsonReporter, withContextFields, type ConsolaLike } from '../consola'
+import { fromConsola, jsonReporter, contextFieldsReporter, type ConsolaLike } from '../consola'
 import {
   _captureEntries,
   _getDefaultLogger,
@@ -105,7 +105,7 @@ function wrappedConsola() {
     level: LogLevels.info,
     throttle: 0,
     reporters: [
-      withContextFields({ log: (logObj: LogObject) => void wrapped.push(logObj) }),
+      contextFieldsReporter({ log: (logObj: LogObject) => void wrapped.push(logObj) }),
       { log: (logObj) => void plain.push(logObj) },
     ],
   })
@@ -146,8 +146,8 @@ describe('fromConsola', () => {
 
     it('makes reporters that createConsola() accepts, from any consola reporter', () => {
       const own = { log: (_logObj: LogObject, _ctx: { options: ConsolaOptions }) => {} }
-      createCoreConsola({ reporters: [jsonReporter(), withContextFields(own)] })
-      expectTypeOf(withContextFields(own)).toExtend<ConsolaReporter>()
+      createCoreConsola({ reporters: [jsonReporter(), contextFieldsReporter(own)] })
+      expectTypeOf(contextFieldsReporter(own)).toExtend<ConsolaReporter>()
       expectTypeOf(jsonReporter()).toExtend<ConsolaReporter>()
     })
   })
@@ -458,7 +458,7 @@ describe('fromConsola', () => {
   })
 })
 
-describe('withContextFields', () => {
+describe('contextFieldsReporter', () => {
   beforeEach(() => {
     _reset()
     _captureEntries()
