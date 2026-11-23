@@ -574,6 +574,28 @@ await withQueueMessage(batch, message, fn, { redact: { value: (v, path) => hide(
 logger.info('login %j', { user, password })
 ```
 
+### Your own logger: pino, winston, consola
+
+When the app already uses pino, winston or consola, keep it: pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own (`request.end`, `span.end`, `<operation> failed`) included. Don't run loggercf's built-in logger next to it.
+
+```ts
+import { createConsola } from 'consola/core'
+import { fromConsola, jsonReporter } from 'loggercf/consola'
+import { withScheduled } from 'loggercf/workers'
+
+// Once, at module scope. Per-process fields only.
+const logger = fromConsola(createConsola({ reporters: [jsonReporter()], throttle: 0 })).child({
+  service: 'jobs',
+})
+
+export const scheduled = withScheduled(async () => {}, { logger })
+```
+
+- pino needs no adapter: `pino({ mixin: currentContextFields, messageKey: 'message' })`, plus the `mixinMergeStrategy` from `docs/loggers/pino.md`, so a call's own `traceId` can't replace the Logging Context's. In a Worker, alias `pino` to `pino/pino.js` in `wrangler.jsonc`: the browser build wrangler picks ignores `mixin`. winston goes through `fromWinston(logger)` (`loggercf/winston`), consola through `fromConsola(consola)` (`loggercf/consola`), anything else through `adaptLogger({ write })` (`loggercf`).
+- Places that take it: `useLogger(logger)`, `runWithLogger({ logger })`, a `TracedEntrypoint`'s `[TracedEntrypoint.rootLogger]` getter, and the `logger` option of `withScheduled`, `withQueueMessage`, `withWorkflow`, `withLogging` and `tracedWorker` (or `logger: (env) => ...`, called once per env).
+- The `logger` option replaces the Root Logger built from env: don't pass `env`, `serializeError` or `redact` with it (it throws). loggercf's Logger Options (Span Defaults, `serializeError`, `limits`, `redact`) don't apply to your own logger; use its own redaction and serializers.
+- Its lines carry `traceId`, `spanId` and the Context Fields only through `currentContextFields()`: pino's `mixin`, or the adapters, which add them on each call. Per-request data still goes in `setLoggerContext`, never in the logger's bindings.
+
 ## Wrangler setup
 
 ```jsonc

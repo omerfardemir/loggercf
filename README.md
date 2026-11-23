@@ -12,11 +12,13 @@ pnpm add hono
 
 ## Entry Points
 
-| Import             | Contents                                                                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `loggercf`         | Core: `createLogger`, `runWithLogger`, `withSpan`, `getLogger`, `setDefaultLogger`, `setLoggerContext`, `loggerOptionsFromEnv`, `tracedFetch`, `tracedFetcher`, trace utilities, types      |
-| `loggercf/hono`    | `useLogger`, `generateId` — Hono middleware; `UseLoggerOptions`, `RequestIdOptions`, `RequestIdSource` types                                                                                |
-| `loggercf/workers` | `TracedSession`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withTrace`, `tracedSession`, `defaultLoggerFromEnv`, `withScheduled`, `withQueueMessage`, `withWorkflow`, `tracedStep` |
+| Import             | Contents                                                                                                                                                                                                                      |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `loggercf`         | Core: `createLogger`, `runWithLogger`, `withSpan`, `getLogger`, `setDefaultLogger`, `setLoggerContext`, `loggerOptionsFromEnv`, `tracedFetch`, `tracedFetcher`, `currentContextFields`, `adaptLogger`, trace utilities, types |
+| `loggercf/hono`    | `useLogger`, `generateId` — Hono middleware; `UseLoggerOptions`, `RequestIdOptions`, `RequestIdSource` types                                                                                                                  |
+| `loggercf/workers` | `TracedSession`, `TracedEntrypoint`, `tracedWorker`, `withLogging`, `withTrace`, `tracedSession`, `defaultLoggerFromEnv`, `withScheduled`, `withQueueMessage`, `withWorkflow`, `tracedStep`                                   |
+| `loggercf/winston` | `fromWinston`, `contextFieldsFormat`, `contextFieldsDefaultMeta` — [winston as your own logger](#your-own-logger-pino-winston-consola)                                                                                        |
+| `loggercf/consola` | `fromConsola`, `contextFieldsReporter`, `jsonReporter` — [consola as your own logger](#your-own-logger-pino-winston-consola)                                                                                                  |
 
 ## How Trace Propagation Works
 
@@ -590,7 +592,7 @@ export default tracedWorker(MySession)
 
 ### `tracedWorker(SessionClass, options?)`
 
-Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class. `options.serializeError` and `options.redact` are the Root Logger's [`serializeError`](#errors-and-size-limits) and [`redact`](#redaction).
+Creates a `WorkerEntrypoint` with a `session(init)` method that instantiates your session class. Zero boilerplate. `options.env` is an env mapping (see [`loggerOptionsFromEnv`](#loggeroptionsfromenvenv-mapping)); the env type comes from your session class. `options.serializeError` and `options.redact` are the Root Logger's [`serializeError`](#errors-and-size-limits) and [`redact`](#redaction). `options.logger` is [your own Root Logger](#your-own-logger-pino-winston-consola) instead of the one built from env.
 
 ```ts
 // This is your entire worker export:
@@ -751,7 +753,7 @@ class SearchWorker extends WorkerEntrypoint<Env> {
 export default withLogging(SearchWorker, { spans: true })
 ```
 
-- Each RPC method call, and `fetch`, gets its own Logging Context from the isolate's Root Logger, built with `loggerOptionsFromEnv(this.env, options.env)` and shared with `TracedEntrypoint` and `tracedWorker`. Every line in it carries the Context Fields `rpcMethod` (the method name) and `entrypoint` (the class name).
+- Each RPC method call, and `fetch`, gets its own Logging Context from the isolate's Root Logger, built with `loggerOptionsFromEnv(this.env, options.env)` and shared with `TracedEntrypoint` and `tracedWorker`, or [your own](#your-own-logger-pino-winston-consola) from `options.logger`. Every line in it carries the Context Fields `rpcMethod` (the method name) and `entrypoint` (the class name).
 - A plain RPC call carries no Trace Carrier, so each call starts a new root trace. `fetch` continues an incoming `traceparent` header.
 - If `fetch` hands the request to a Hono app that uses `useLogger` (`fetch(req) { return app.fetch(req, this.env, this.ctx) }`), pass `fetch: false`. `useLogger` opens its own Logging Context and continues `traceparent` itself; with `fetch` wrapped as well, one request is split into two root traces. With `fetch: false`, `fetch` is inherited unchanged and the RPC methods are still wrapped.
 - A method called while any Logging Context is active joins that context, as a child Span when `spans` is on, and adds no `rpcMethod` or `entrypoint` of its own. That covers a public method called from another one (`this.normalize(q)`) and a call made inside another helper's context (from a [`withScheduled`](#withscheduledhandler-options) handler, say). Inside another method's context, its lines keep the caller's `rpcMethod`: when `nested()` calls `this.search()`, the child Span is `X.search`, but every line in it says `rpcMethod: 'nested'`.
@@ -760,8 +762,8 @@ export default withLogging(SearchWorker, { spans: true })
 - `entrypoint` is the class's `name`. A build that minifies class names changes it. An anonymous class (`withLogging(class extends WorkerEntrypoint { ... })`) gets no `entrypoint` field, and its Spans are named by the method alone.
 - Only the methods the class has when it is wrapped are wrapped. Put every RPC method on the class before wrapping it. A method added or overridden in a subclass of the wrapped class (`class Ext extends withLogging(A) { extra() {} }`) runs outside every Logging Context, so extend the wrapped class only to add handlers.
 - The class must extend `WorkerEntrypoint` or `DurableObject` (see [Durable Objects](#durable-objects)). Wrapping anything else throws.
-- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env`, `serializeError` or `redact` as well throws; override `[TracedEntrypoint.envMapping]` or `[TracedEntrypoint.loggerOptions]` instead.
-- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch`, `env`, `serializeError` and `redact`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
+- A `TracedEntrypoint` subclass keeps its own Root Logger hook, so its `[TracedEntrypoint.envMapping]` / `[TracedEntrypoint.loggerOptions]` overrides apply. Passing `env`, `serializeError`, `redact` or `logger` as well throws; override `[TracedEntrypoint.envMapping]`, `[TracedEntrypoint.loggerOptions]` or `[TracedEntrypoint.rootLogger]` instead.
+- Wrapping a class that `withLogging` returned gives back the same class when the options are the same (`spans`, `session`, `fetch`, `env`, `serializeError`, `redact` and `logger`), and throws when they differ. Wrapping a subclass of one throws too. This keeps each call to one `span.end`.
 - With `session: true`, a field the caller passes named `rpcMethod` or `entrypoint` is replaced by the receiver's.
 - Only method calls are wrapped. A method named like a handler (`trace`, `test`, `email`, `connect`, `queue`, `tail` or `tailStream`) is never wrapped. These run outside the Logging Context: a getter read over RPC, and the body of an `async *` method, which runs on each `.next()`, after the call has returned. A sync method that returns an un-awaited `RpcPromise` gets a span that ends when the method returns, not when the promise settles (`spans` treats only a real `Promise` as async). Make the method `async` and `await` the call to time it.
 
@@ -847,7 +849,7 @@ export default {
 } satisfies ExportedHandler<Env>
 ```
 
-- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, with `options.serializeError` and `options.redact`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins).
+- The Root Logger comes from the handler's `env` through `loggerOptionsFromEnv(env, options.env)`, with `options.serializeError` and `options.redact`, cached per isolate and registered as the [Default Logger](#setdefaultloggerlogger) unless one is already set (first seen wins). `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola).
 - The handler gets the same arguments; its return value is returned and a throw rethrown unchanged. It never calls `controller.noRetry()`.
 - On a class entrypoint (`WorkerEntrypoint`, `TracedEntrypoint`, `tracedWorker(...)`, `withLogging(...)`), wrap the handler once at module scope and call it from the method with `this.env` and `this.ctx`:
 
@@ -896,7 +898,7 @@ export default {
 - For an unsampled trace (`traceFlags` `00`) the `span.end` timing line is skipped, but a throw is still logged: one `queue.message failed` line at `ERROR` with `err` and a `span` object without timing (`operation`, `status: 'ERROR'`, `error`). A new root trace is always sampled.
 - `await` (or return) every call. The batch is acked implicitly when `queue` returns, so with a missing `await` the handler can return, and the batch be acked, while the work is still running, and its throw is lost.
 - Running the messages concurrently is safe: `await Promise.all(batch.messages.map((m) => withQueueMessage(batch, m, () => handle(m))))`. Each call has its own Logging Context, so Context Fields and traces never mix between messages.
-- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping-options) reads it) with `options.env` as the Env Mapping, `options.serializeError` and `options.redact`, and registered as the Default Logger unless one is already set.
+- The Root Logger is built from the Worker's env (`import { env } from 'cloudflare:workers'`, as [`defaultLoggerFromEnv`](#defaultloggerfromenvmapping-options) reads it) with `options.env` as the Env Mapping, `options.serializeError` and `options.redact`, and registered as the Default Logger unless one is already set. `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola).
 
 ### `withWorkflow(Class, options?)` and `tracedStep(step, name, ...)`
 
@@ -930,7 +932,7 @@ await env.REPORT.create({ params: { ...params, trace: getTraceCarrier() } })
 - When the payload has a Trace Carrier under `trace`, `run` continues it, so every replay of one instance shares the creator's `traceId`. Without one, each execution of `run` (every replay after a sleep, wait or restart) starts a new root trace, so one instance's lines span several `traceId`s: join them on `workflowInstanceId`, or pass `trace: getTraceCarrier()` to `create()`.
 - `run` itself writes no Span: it is replayed from the top after every sleep and wait, and a pause or termination surfaces in it as a throw. Lines logged in `run` outside a step repeat on each replay.
 - **A throw outside every `tracedStep` is not logged.** That covers validation before the first step, code between steps, and a plain `step.do`. The engine uses thrown errors in `run` for its own control flow (pause, terminate, restart; locally these are `Error`s whose message starts with `Aborting engine:`), and neither `@cloudflare/workers-types` nor the Workflows docs define a marker that tells them apart from your errors in production, so `withWorkflow` does not log when `run` rejects rather than log engine control as `ERROR`. Such a throw still fails the instance and shows as its error in the Workflows dashboard and `instance.status()`. Put every unit of work, validation included, in a `tracedStep`, which logs each failed attempt.
-- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env`, `options.serializeError` and `options.redact`, registered as the Default Logger in the constructor unless one is already set. Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
+- `run` must be a method, not a class field. The Root Logger comes from the Workflow's `env` with `options.env`, `options.serializeError` and `options.redact`, registered as the Default Logger in the constructor unless one is already set. `options.logger` replaces it with [your own logger](#your-own-logger-pino-winston-consola). Wrapping the result again with the same options returns it; a subclass of it throws. As for Durable Objects, add `export type Report = InstanceType<typeof Report>` if `wrangler types` refers to the export as a type.
 - Outside a Logging Context (a class not wrapped with `withWorkflow`), `tracedStep` calls `step.do` with the arguments untouched and logs nothing.
 
 ### Service Type Convention
@@ -1379,6 +1381,101 @@ Only the final write differs, detected at startup:
 
 ---
 
+## Your Own Logger (pino, winston, consola)
+
+loggercf's built-in logger is the default, but the Cloudflare parts (Logging Contexts, trace propagation, Request Lines, Spans, `withLogging`, the cron, queue and Workflow helpers) work with a logger you already use. Pass it wherever loggercf takes a Root Logger, and every line of its Logging Contexts goes through it, loggercf's own included, so all lines share one output and one format.
+
+| Logger  | Adapter                                                     | Context Fields on its lines                                                                                                          | Recipe                                             |
+| ------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------- |
+| pino    | none: pass the pino logger as it is                         | `mixin: currentContextFields`                                                                                                        | [docs/loggers/pino.md](docs/loggers/pino.md)       |
+| winston | `fromWinston(logger)` from `loggercf/winston`               | added by `fromWinston` during each call; `contextFieldsDefaultMeta()` or the `contextFieldsFormat()` format for direct winston calls | [docs/loggers/winston.md](docs/loggers/winston.md) |
+| consola | `fromConsola(consola)` from `loggercf/consola`              | added by `fromConsola`; `contextFieldsReporter(reporter)` or `jsonReporter()` for direct consola calls                               | [docs/loggers/consola.md](docs/loggers/consola.md) |
+| other   | [`adaptLogger(target)`](#adaptloggertarget) from `loggercf` | [`currentContextFields()`](#currentcontextfields) in your `write`                                                                    | below                                              |
+
+The adapters import nothing from winston or consola, at runtime or in their types: they work with the version you installed.
+
+### The Logger Port
+
+loggercf calls three things on a Root Logger:
+
+- each level method (`trace`, `debug`, `info`, `warn`, `error`, `fatal`) as `(fields, message, ...args)`, where the message may hold `printf` placeholders (`logger.info({ span }, 'span.end %s', operation)`), or as `(message)`;
+- `child(bindings)`, once per Logging Context (`child({})`), and for your own `.child()` calls.
+
+That is loggercf's `Logger` interface. A pino logger has this shape already. A logger without it is rejected when you pass it to a Workers helper, with a `TypeError` naming the methods it lacks.
+
+### Where to pass it
+
+```ts
+import { runWithLogger } from 'loggercf'
+import { useLogger } from 'loggercf/hono'
+import { TracedEntrypoint, withLogging, withScheduled } from 'loggercf/workers'
+
+app.use(useLogger(logger)) // Hono
+runWithLogger({ logger, traceparent }, () => handle()) // anything else
+
+export const scheduled = withScheduled(nightly, { logger })
+export const Search = withLogging(SearchBase, { logger })
+
+// A function of env, called once per env (once per isolate):
+export const Jobs = withLogging(JobsBase, { logger: (env: Env) => makeLogger(env) })
+
+// A TracedEntrypoint supplies it through its Root Logger hook:
+export class Bind extends TracedEntrypoint<Env> {
+  protected override get [TracedEntrypoint.rootLogger]() {
+    return logger
+  }
+}
+```
+
+The `logger` option is on `withScheduled`, `withQueueMessage`, `withWorkflow`, `withLogging` and `tracedWorker`. It replaces the Root Logger built from env, so passing `env`, `serializeError` or `redact` with it throws: configure your own logger instead. Like a built Root Logger, it becomes the [Default Logger](#setdefaultloggerlogger) unless one is already set, and `getLogger()` returns it (a child of it) inside each Logging Context.
+
+Keep it per-process: build it once at module scope, or from env with the function form. Per-unit-of-work data still goes in Context Fields (`setLoggerContext`), never in its bindings.
+
+### `currentContextFields()`
+
+The current Logging Context's Context Fields, then `traceId`, `spanId` and `parentSpanId` (left out of a root trace); `{}` outside a Logging Context. The trace IDs win over a Context Field of the same name, and each call returns a new object. loggercf's built-in logger writes these on every line itself; your logger writes them where you add them to its per-line hook.
+
+```ts
+import pino from 'pino'
+import { currentContextFields } from 'loggercf'
+
+const logger = pino({ mixin: currentContextFields })
+```
+
+pino writes a call's fields over the mixin's, so a call's own `traceId` would replace the Logging Context's; the [pino recipe](docs/loggers/pino.md#the-root-logger) adds a `mixinMergeStrategy` that writes the trace IDs last.
+
+### `adaptLogger(target)`
+
+Builds a `Logger` over any logger that doesn't have the Logger Port's shape, from a **Line Target**: a `write(line)` and an optional `child(bindings)`. Each call goes through loggercf's [Argument Routing](#where-each-argument-goes) first, in either call style, so `write` gets `{ level, message, fields }`: the message with its placeholders filled in (absent when the call gave none), and the fields as a plain object, with `err` (the first `Error`, unserialized), `errors` and `args`. Without `child`, the adapted logger keeps the bindings itself and writes them first in `fields`; the call's fields win on a shared key.
+
+```ts
+import { adaptLogger, currentContextFields } from 'loggercf'
+
+const logger = adaptLogger({
+  // console prints an Error with its stack; JSON.stringify would write it as {}.
+  write: ({ level, message, fields }) =>
+    console.log(level, message ?? '', { ...currentContextFields(), ...fields }),
+})
+```
+
+It adds nothing of its own: no time, no level filter, no Context Fields (add `currentContextFields()` in `write`, as above), and no serialization: an `Error` in `fields` is still an `Error`, so a `write` that builds JSON must serialize it. A log call never throws: a `write` that throws loses only its own line.
+
+### What doesn't apply
+
+The Logger Options configure loggercf's built-in logger, so with your own they don't apply: no [Span Defaults](#span-defaults) (Spans use `info` and no Slow Threshold, unless a Span's own options say otherwise), no [Error Serializer, Line Limits](#errors-and-size-limits) or [Redactor](#redaction). Use your logger's own: pino's `redact` and `serializers`, a winston format, a consola reporter (`fromWinston` takes the same `serializeError` for the lines it writes). Your logger's own call style and level filtering also apply to `getLogger()` calls: loggercf routes the arguments only for its built-in logger and for `adaptLogger`.
+
+### Workers caveats
+
+loggercf itself needs `nodejs_compat` (for `node:async_hooks`). What each logger adds on top, measured with wrangler 4.160 (`wrangler deploy --dry-run`, and `wrangler dev` for the output); each recipe has the details:
+
+- **pino**: wrangler resolves `pino` to its browser build, which ignores `mixin` and `base` and writes the raw arguments to `console`, so loggercf's `%s` placeholders are never filled. Alias `pino` to its Node build (`"alias": { "pino": "pino/pino.js" }` in `wrangler.jsonc`), which needs `nodejs_compat`. Transports (`pino.transport()`, worker threads) don't run in Workers: write each line to `console` with a destination instead. The Node build adds about 160 KiB to the upload (about 30 KiB gzip).
+- **winston**: needs `nodejs_compat` (it imports `fs`, `http`, `zlib` and more). Only the Console transport is useful in a Worker. workerd's `util.debuglog` is always on, so winston's streams print `STREAM:` debug lines next to each log line unless you alias `util`. It adds about 400 KiB to the upload (about 67 KiB gzip; 172 KiB minified).
+- **consola**: bundles without `nodejs_compat`; every entry resolves to its browser build. Use `consola/core` with `jsonReporter()` (one JSON line per log through `console.debug` / `info` / `warn` / `error`, so Workers Logs sees the severity) and `throttle: 0` (consola holds repeated lines on a timer, which a Worker can lose). It adds about 25 KiB to the upload (about 6 KiB gzip).
+
+loggercf's built-in logger stays in the bundle when you bring your own.
+
+---
+
 ## Agent skill
 
 The package ships an [Agent Skill](https://agentskills.io) at `skills/loggercf/SKILL.md` for AI coding agents working in your project. It covers which API fits each unit of work (Hono, Worker RPC, queues, cron), the rules the types can't express (one Root Logger per isolate, per-request data in Context Fields, `this.traced` around every RPC method, log call shape) and the Wrangler setup. For signatures it points back to this README.
@@ -1391,10 +1488,19 @@ With pnpm 12.11 or later, run `pnpm approve` after installing and approve `logge
 
 ```
 loggercf/
-├── src/                  # loggercf source and colocated *.test.ts
-│   ├── index.ts          # Core entry: logger, Logging Context, Trace Carrier, types
+├── src/                  # loggercf source, each *.test.ts next to the module it covers
+│   ├── index.ts          # loggercf entry (the entry files only re-export)
 │   ├── hono.ts           # loggercf/hono entry
-│   └── workers.ts        # loggercf/workers entry
+│   ├── workers.ts        # loggercf/workers entry
+│   ├── winston.ts        # loggercf/winston entry
+│   ├── consola.ts        # loggercf/consola entry
+│   ├── core/             # Logging Context, Root and Default Logger, Spans, Env Mapping, types
+│   ├── trace/            # W3C Trace Context and Trace Carrier, tracedFetch
+│   ├── output/           # A line: Argument Routing, serialization, Line Limits, Redactor
+│   ├── hono/             # useLogger middleware
+│   ├── workers/          # Traced Sessions, withLogging, the cron, queue and Workflow helpers
+│   ├── loggers/          # Your Own Logger: adaptLogger, the winston and consola adapters
+│   └── testing/          # Helpers shared by the tests
 ├── dev/                  # Local Worker fixtures for e2e verification (not published)
 │   ├── services.d.ts     # Shared RPC service interfaces
 │   ├── main-worker/      # Gateway worker (Hono + routes)
@@ -1403,6 +1509,7 @@ loggercf/
 ├── skills/loggercf/     # Agent skill shipped in the package
 ├── scripts/e2e-local.mjs # Starts the dev workers, probes trace propagation, checks their logs
 └── docs/                 # Design deep-dives
+    └── loggers/          # Recipes for Your Own Logger: pino, winston, consola
 ```
 
 The dev workers import `loggercf` by package name, which resolves to this package's built `dist/` — run `pnpm build` before `pnpm dev`.

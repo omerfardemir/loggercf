@@ -32,6 +32,14 @@
     "./workers": {
       "types": "./dist/workers.d.ts",
       "import": "./dist/workers.js"
+    },
+    "./winston": {
+      "types": "./dist/winston.d.ts",
+      "import": "./dist/winston.js"
+    },
+    "./consola": {
+      "types": "./dist/consola.d.ts",
+      "import": "./dist/consola.js"
     }
   },
   "scripts": {
@@ -55,13 +63,16 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261112.1",
     "@types/node": "^25.6.0",
+    "consola": "^3.4.2",
     "hono": "^4.12.14",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
+    "pino": "^10.4.0",
     "publint": "^0.3.21",
     "tsdown": "^0.23.7",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
+    "winston": "^3.19.0",
     "wrangler": "^4.160.1"
   },
   "peerDependencies": {

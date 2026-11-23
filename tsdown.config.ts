@@ -5,6 +5,8 @@ export default defineConfig({
     index: './src/index.ts',
     hono: './src/hono.ts',
     workers: './src/workers.ts',
+    winston: './src/winston.ts',
+    consola: './src/consola.ts',
   },
   dts: true,
   format: ['esm'],
