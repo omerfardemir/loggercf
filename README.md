@@ -1514,17 +1514,17 @@ loggercf/
 
 The dev workers import `loggercf` by package name, which resolves to this package's built `dist/` — run `pnpm build` before `pnpm dev`.
 
-| Script                             | Purpose                                                                      |
-| ---------------------------------- | ---------------------------------------------------------------------------- |
-| `pnpm build`                       | Build `dist/` with tsdown                                                    |
-| `pnpm test`                        | Run unit tests (Vitest)                                                      |
-| `pnpm typecheck` / `typecheck:dev` | Typecheck the package / the dev workers (needs a build)                      |
-| `pnpm check:skill`                 | Typecheck the ts snippets in `skills/**/SKILL.md` (needs a build)            |
-| `pnpm lint` / `lint:fix`           | Lint with oxlint                                                             |
-| `pnpm format` / `format:check`     | Format with oxfmt                                                            |
-| `pnpm dev`                         | Run all three dev workers on `http://localhost:8787`                         |
-| `pnpm e2e:local`                   | Build, start the dev workers, assert trace propagation in responses and logs |
-| `pnpm release:check`               | Everything above plus `npm pack --dry-run`                                   |
+| Script                             | Purpose                                                                       |
+| ---------------------------------- | ----------------------------------------------------------------------------- |
+| `pnpm build`                       | Build `dist/` with tsdown                                                     |
+| `pnpm test`                        | Run the tests (Vitest); the timing tests (`*.timing.test.ts`) run last, alone |
+| `pnpm typecheck` / `typecheck:dev` | Typecheck the package / the dev workers (needs a build)                       |
+| `pnpm check:skill`                 | Typecheck the ts snippets in `skills/**/SKILL.md` (needs a build)             |
+| `pnpm lint` / `lint:fix`           | Lint with oxlint                                                              |
+| `pnpm format` / `format:check`     | Format with oxfmt                                                             |
+| `pnpm dev`                         | Run all three dev workers on `http://localhost:8787`                          |
+| `pnpm e2e:local`                   | Build, start the dev workers, assert trace propagation in responses and logs  |
+| `pnpm release:check`               | Everything above plus `npm pack --dry-run`                                    |
 
 CI (`.github/workflows/ci.yml`) runs every check above, plus the e2e, on Ubuntu for each pull request and push to `main`.
 
